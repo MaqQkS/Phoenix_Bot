@@ -1,6 +1,8 @@
 """
 database.py — SQLite persistence via aiosqlite.
 Stores and retrieves TrackedToken objects.
+Also stores alert history for performance tracking.
+Also stores fee_gate_log, lp_floor_log, stillborn_log for shadow-mode filters.
 """
 
 import aiosqlite
@@ -42,7 +44,264 @@ async def init_db(db_path: str = DB_PATH):
                 last_alerted_tier INTEGER
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pumpswap_fees (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                signature       TEXT NOT NULL,
+                slot            INTEGER NOT NULL,
+                block_time      REAL,
+                pool_address    TEXT NOT NULL,
+                token_address   TEXT,
+                event_type      TEXT NOT NULL,
+                lp_fee          INTEGER NOT NULL,
+                protocol_fee    INTEGER NOT NULL,
+                creator_fee     INTEGER NOT NULL DEFAULT 0,
+                total_fee       INTEGER NOT NULL,
+                received_at     REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pumpswap_fees_signature
+            ON pumpswap_fees(signature, event_type)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pumpswap_fees_pool
+            ON pumpswap_fees(pool_address)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pumpswap_fees_token
+            ON pumpswap_fees(token_address)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                address         TEXT NOT NULL,
+                symbol          TEXT,
+                tier_index      INTEGER NOT NULL,
+                tier_name       TEXT,
+                alert_price     REAL NOT NULL,
+                alert_mcap      REAL NOT NULL,
+                ath_price       REAL,
+                ath_mcap        REAL,
+                peak_price_after REAL DEFAULT 0,
+                peak_mcap_after  REAL DEFAULT 0,
+                alert_time      REAL NOT NULL,
+                FOREIGN KEY (address) REFERENCES tokens(address)
+            )
+        """)
+        # ── Fee Gate shadow log ────────────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fee_gate_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address   TEXT NOT NULL,
+                symbol          TEXT,
+                alert_tier      INTEGER NOT NULL,
+                tier_name       TEXT,
+                alert_time      REAL NOT NULL,
+                total_fee       REAL,
+                lp_fee          REAL,
+                proto_fee       REAL,
+                creator_fee     REAL,
+                rate            REAL,
+                events          INTEGER,
+                creator_share   REAL,
+                proto_share     REAL,
+                fee_per_event   REAL,
+                proto_to_lp     REAL,
+                score           INTEGER,
+                flags           TEXT,
+                label           TEXT,
+                manual_verdict  TEXT,
+                reviewed_at     REAL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fgl_token ON fee_gate_log(token_address)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fgl_label ON fee_gate_log(label)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fgl_time  ON fee_gate_log(alert_time)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fgl_tier  ON fee_gate_log(alert_tier)")
+
+        # ── Alert Block log (hard-block decisions) ────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS alert_block_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address    TEXT NOT NULL,
+                symbol           TEXT,
+                would_have_tier  INTEGER NOT NULL,
+                tier_name        TEXT,
+                block_time       REAL NOT NULL,
+                block_reason     TEXT NOT NULL,
+                fee_gate_log_id  INTEGER,
+                no_fee_data      INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (token_address) REFERENCES tokens(address),
+                FOREIGN KEY (fee_gate_log_id) REFERENCES fee_gate_log(id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_abl_token  ON alert_block_log(token_address)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_abl_time   ON alert_block_log(block_time)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_abl_reason ON alert_block_log(block_reason)")
+
+        # ── LP Floor shadow log ────────────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS lp_floor_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address   TEXT NOT NULL,
+                symbol          TEXT,
+                alert_tier      INTEGER NOT NULL,
+                tier_name       TEXT,
+                alert_time      REAL NOT NULL,
+                liquidity_usd   REAL,
+                label           TEXT,
+                reason          TEXT,
+                manual_verdict  TEXT,
+                reviewed_at     REAL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lpf_token ON lp_floor_log(token_address)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lpf_label ON lp_floor_log(label)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lpf_time  ON lp_floor_log(alert_time)")
+
+        # ── Stillborn shadow log ───────────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS stillborn_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address   TEXT NOT NULL,
+                symbol          TEXT,
+                alert_tier      INTEGER NOT NULL,
+                tier_name       TEXT,
+                alert_time      REAL NOT NULL,
+                events          INTEGER,
+                total_fee_sol   REAL,
+                label           TEXT,
+                reason          TEXT,
+                manual_verdict  TEXT,
+                reviewed_at     REAL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sb_token ON stillborn_log(token_address)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sb_label ON stillborn_log(label)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sb_time  ON stillborn_log(alert_time)")
+
+        # ── Ante shadow log ────────────────────────────────────────────────
+        # Observe-only Phase 1 primitive: per-swap fee burn rolling stats,
+        # logged once per fired dip alert. Never gates.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ante_log (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address         TEXT NOT NULL,
+                symbol                TEXT,
+                alert_tier            INTEGER,
+                tier_name             TEXT,
+                alert_time            REAL NOT NULL,
+                -- Last-20-swaps window (distinct-signature samples)
+                ante_n20_count        INTEGER,
+                ante_n20_median_sol   REAL,
+                ante_n20_p25_sol      REAL,
+                ante_n20_p75_sol      REAL,
+                ante_n20_width_ratio  REAL,
+                -- Last-5-minutes window
+                ante_5m_count         INTEGER,
+                ante_5m_median_sol    REAL,
+                ante_5m_p25_sol       REAL,
+                ante_5m_p75_sol       REAL,
+                ante_5m_width_ratio   REAL,
+                -- Diagnostics
+                base_fee_coverage     REAL,
+                manual_verdict        TEXT,
+                reviewed_at           REAL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ante_token ON ante_log(token_address)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ante_time  ON ante_log(alert_time)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ante_tier  ON ante_log(alert_tier)")
+
+        # ── Inspection Gate shadow log ─────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS inspection_gate_log (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address           TEXT NOT NULL,
+                symbol                  TEXT,
+                inception_slot          INTEGER,
+                inception_block_time    INTEGER,
+                window_end_slot         INTEGER,
+                buy_count               INTEGER DEFAULT 0,
+                sell_count              INTEGER DEFAULT 0,
+                buy_sol                 REAL DEFAULT 0,
+                sell_sol                REAL DEFAULT 0,
+                gross_sol               REAL DEFAULT 0,
+                net_sol                 REAL DEFAULT 0,
+                sol_price_usd           REAL,
+                buy_usd                 REAL DEFAULT 0,
+                sell_usd                REAL DEFAULT 0,
+                sell_to_buy_ratio       REAL DEFAULT 0,
+                label                   TEXT,
+                threshold_version       TEXT DEFAULT 'v1_10000usd_0.05ratio',
+                check_started_at        INTEGER,
+                check_completed_at      INTEGER,
+                check_latency_ms        INTEGER,
+                rpc_calls_made          INTEGER DEFAULT 0,
+                retry_attempted         INTEGER DEFAULT 0,
+                error_reason            TEXT,
+                alert_id                INTEGER,
+                FOREIGN KEY (alert_id) REFERENCES alerts(id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_bgl_token ON inspection_gate_log(token_address)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_bgl_label ON inspection_gate_log(label)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_bgl_inception ON inspection_gate_log(inception_block_time)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_bgl_alert ON inspection_gate_log(alert_id)")
+
         await db.commit()
+
+        # ── Migration: add creator_fee column to pumpswap_fees if upgrading ─
+        async with db.execute("PRAGMA table_info(pumpswap_fees)") as cur:
+            cols = [row[1] async for row in cur]
+        if "creator_fee" not in cols:
+            await db.execute("ALTER TABLE pumpswap_fees ADD COLUMN creator_fee INTEGER NOT NULL DEFAULT 0")
+            await db.commit()
+            logger.info("Migrated pumpswap_fees: added creator_fee column")
+
+        # ── Migration: Ante Phase 1 — add base_fee + signature_count ─────
+        # Both nullable (forward-only capture). Historical rows stay NULL and
+        # roll up as "partial Ante" (priority + jito only) in analysis tools.
+        async with db.execute("PRAGMA table_info(pumpswap_fees)") as cur:
+            cols = [row[1] async for row in cur]
+        if "base_fee" not in cols:
+            await db.execute("ALTER TABLE pumpswap_fees ADD COLUMN base_fee INTEGER")
+            await db.commit()
+            logger.info("Migrated pumpswap_fees: added base_fee column")
+        if "signature_count" not in cols:
+            await db.execute("ALTER TABLE pumpswap_fees ADD COLUMN signature_count INTEGER")
+            await db.commit()
+            logger.info("Migrated pumpswap_fees: added signature_count column")
+
+        # Schema drift recovery — columns added out-of-band on the live DB.
+        # Guarded so fresh DBs get them and existing DBs silently skip.
+        for col_sql in [
+            "ALTER TABLE pumpswap_fees ADD COLUMN priority_fee INTEGER",
+            "ALTER TABLE pumpswap_fees ADD COLUMN jito_tip INTEGER",
+            "ALTER TABLE pumpswap_fees ADD COLUMN compute_units_consumed INTEGER",
+            "ALTER TABLE pumpswap_fees ADD COLUMN quote_amount INTEGER DEFAULT 0",
+            "ALTER TABLE pumpswap_fees ADD COLUMN user_pubkey TEXT",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass
+
+        # ── Migration: Ante Phase 1.1 — width-ratio columns on ante_log ──
+        # Both nullable. NULL means insufficient samples to compute (e.g. zero
+        # swaps in window). Capped at 10000 in the producer to bound storage.
+        async with db.execute("PRAGMA table_info(ante_log)") as cur:
+            ante_cols = [row[1] async for row in cur]
+        if "ante_n20_width_ratio" not in ante_cols:
+            await db.execute("ALTER TABLE ante_log ADD COLUMN ante_n20_width_ratio REAL")
+            await db.commit()
+            logger.info("Migrated ante_log: added ante_n20_width_ratio column")
+        if "ante_5m_width_ratio" not in ante_cols:
+            await db.execute("ALTER TABLE ante_log ADD COLUMN ante_5m_width_ratio REAL")
+            await db.commit()
+            logger.info("Migrated ante_log: added ante_5m_width_ratio column")
+
     logger.info(f"Database initialised at {db_path}")
 
 
@@ -112,6 +371,99 @@ async def token_exists(address: str, db_path: str = DB_PATH) -> bool:
     return await get_token(address, db_path) is not None
 
 
+# ── Alert History ─────────────────────────────────────────────────────────────
+
+async def save_alert(
+    address: str,
+    symbol: str,
+    tier_index: int,
+    tier_name: str,
+    alert_price: float,
+    alert_mcap: float,
+    ath_price: float,
+    ath_mcap: float,
+    alert_time: float | None = None,
+    db_path: str = DB_PATH,
+):
+    """Save an alert record when a dip alert fires."""
+    ts = alert_time if alert_time is not None else time.time()
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            INSERT INTO alerts (
+                address, symbol, tier_index, tier_name,
+                alert_price, alert_mcap, ath_price, ath_mcap,
+                peak_price_after, peak_mcap_after, alert_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            address, symbol, tier_index, tier_name,
+            alert_price, alert_mcap, ath_price, ath_mcap,
+            alert_price, alert_mcap, ts,
+        ))
+        await db.commit()
+
+
+async def update_peak_after_alert(
+    address: str,
+    current_price: float,
+    current_mcap: float,
+    db_path: str = DB_PATH,
+):
+    """Update peak_price_after for all alerts on this token if current price is higher."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            UPDATE alerts
+            SET peak_price_after = ?,
+                peak_mcap_after = ?
+            WHERE address = ?
+              AND peak_price_after < ?
+        """, (current_price, current_mcap, address, current_price))
+        await db.commit()
+
+
+async def get_alerts_since(
+    since_time: float,
+    db_path: str = DB_PATH,
+) -> list[dict]:
+    """Get all alerts fired since a given timestamp."""
+    if not os.path.exists(db_path):
+        return []
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM alerts WHERE alert_time >= ? ORDER BY alert_time DESC",
+            (since_time,),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+
+async def get_all_alerts(db_path: str = DB_PATH) -> list[dict]:
+    """Get all alert records."""
+    if not os.path.exists(db_path):
+        return []
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM alerts ORDER BY alert_time DESC"
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+
+async def get_alerts_for_token(
+    address: str,
+    db_path: str = DB_PATH,
+) -> list[dict]:
+    """Get all alerts for a specific token."""
+    if not os.path.exists(db_path):
+        return []
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM alerts WHERE address = ? ORDER BY alert_time ASC",
+            (address,),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+
 def _row_to_token(row) -> TrackedToken:
     return TrackedToken(
         address           = row["address"],
@@ -133,3 +485,288 @@ def _row_to_token(row) -> TrackedToken:
         last_price_update = row["last_price_update"] or 0.0,
         last_alerted_tier = row["last_alerted_tier"] if row["last_alerted_tier"] is not None else -1,
     )
+
+
+# ── PumpSwap Fees ────────────────────────────────────────────────────────────
+
+async def save_pumpswap_fee(
+    signature: str,
+    slot: int,
+    block_time: float | None,
+    pool_address: str,
+    token_address: str | None,
+    event_type: str,
+    lp_fee: int,
+    protocol_fee: int,
+    creator_fee: int = 0,
+    db_path: str = DB_PATH,
+) -> bool:
+    """
+    Save a decoded PumpSwap BuyEvent/SellEvent fee record.
+    Returns True if inserted, False if it was a duplicate signature.
+    """
+    import time as _time
+    total_fee = lp_fee + protocol_fee + creator_fee
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("""
+                INSERT INTO pumpswap_fees (
+                    signature, slot, block_time, pool_address, token_address,
+                    event_type, lp_fee, protocol_fee, creator_fee, total_fee, received_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                signature, slot, block_time, pool_address, token_address,
+                event_type, lp_fee, protocol_fee, creator_fee, total_fee, _time.time(),
+            ))
+            await db.commit()
+        return True
+    except aiosqlite.IntegrityError:
+        return False
+
+
+async def get_pool_fees_total(
+    pool_address: str,
+    db_path: str = DB_PATH,
+) -> dict:
+    """
+    Sum all fees recorded for a given pool.
+    Returns dict with lp, proto, creator, total (lamports), event_count, total_sol.
+    """
+    if not os.path.exists(db_path):
+        return {
+            "total_lp_fee": 0, "total_protocol_fee": 0, "total_creator_fee": 0,
+            "total_fee": 0, "event_count": 0, "total_fee_sol": 0.0,
+        }
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute("""
+            SELECT
+                COALESCE(SUM(lp_fee), 0)       AS lp,
+                COALESCE(SUM(protocol_fee), 0) AS proto,
+                COALESCE(SUM(creator_fee), 0)  AS creator,
+                COALESCE(SUM(total_fee), 0)    AS total,
+                COUNT(*)                        AS cnt
+            FROM pumpswap_fees
+            WHERE pool_address = ?
+        """, (pool_address,)) as cursor:
+            row = await cursor.fetchone()
+    return {
+        "total_lp_fee":       row[0],
+        "total_protocol_fee": row[1],
+        "total_creator_fee":  row[2],
+        "total_fee":          row[3],
+        "event_count":        row[4],
+        "total_fee_sol":      row[3] / 1_000_000_000,
+    }
+
+
+async def save_pumpswap_fees_batch(
+    records: list[dict],
+    db_path: str = DB_PATH,
+) -> int:
+    """
+    Insert a batch of pumpswap_fees rows in a single transaction.
+    Returns the number of rows actually inserted.
+    """
+    if not records:
+        return 0
+    import time as _time
+    now = _time.time()
+    rows = [
+        (
+            r["signature"],
+            r["slot"],
+            r.get("block_time"),
+            r["pool_address"],
+            r.get("token_address"),
+            r["event_type"],
+            r.get("quote_amount", 0),
+            r["lp_fee"],
+            r["protocol_fee"],
+            r.get("creator_fee", 0),
+            r["lp_fee"] + r["protocol_fee"] + r.get("creator_fee", 0),
+            now,
+            r.get("priority_fee"),
+            r.get("jito_tip"),
+            r.get("compute_units_consumed"),
+            r.get("user_pubkey"),
+            r.get("base_fee"),         # Ante Phase 1: tx-level, first-event-row only
+            r.get("signature_count"),  # Ante Phase 1: tx-level, first-event-row only
+        )
+        for r in records
+    ]
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.executemany("""
+            INSERT OR IGNORE INTO pumpswap_fees (
+                signature, slot, block_time, pool_address, token_address,
+                event_type, quote_amount, lp_fee, protocol_fee, creator_fee, total_fee, received_at,
+                priority_fee, jito_tip, compute_units_consumed, user_pubkey,
+                base_fee, signature_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        await db.commit()
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+
+# ── Fee Gate shadow log ──────────────────────────────────────────────────────
+
+async def log_fee_gate(
+    token_address: str,
+    symbol: str,
+    alert_tier: int,
+    tier_name: str,
+    alert_time: float,
+    total_fee: float,
+    lp_fee: float,
+    proto_fee: float,
+    creator_fee: float,
+    rate: float,
+    events: int,
+    creator_share: float,
+    proto_share: float,
+    fee_per_event: float,
+    proto_to_lp: float,
+    score: int,
+    flags: list,
+    label: str,
+    db_path: str = DB_PATH,
+) -> int:
+    """Insert one fee_gate_log row. Returns the inserted row's id (lastrowid)."""
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""
+            INSERT INTO fee_gate_log (
+                token_address, symbol, alert_tier, tier_name, alert_time,
+                total_fee, lp_fee, proto_fee, creator_fee, rate, events,
+                creator_share, proto_share, fee_per_event, proto_to_lp,
+                score, flags, label
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            token_address, symbol, alert_tier, tier_name, alert_time,
+            total_fee, lp_fee, proto_fee, creator_fee, rate, events,
+            creator_share, proto_share, fee_per_event, proto_to_lp,
+            score, ",".join(flags) if flags else "", label,
+        ))
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def log_alert_block(
+    token_address: str,
+    symbol: str,
+    would_have_tier: int,
+    tier_name: str,
+    block_time: float,
+    block_reason: str,
+    fee_gate_log_id: int | None = None,
+    no_fee_data: bool = False,
+    db_path: str = DB_PATH,
+) -> int:
+    """Insert one alert_block_log row. Returns the inserted row's id."""
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""
+            INSERT INTO alert_block_log (
+                token_address, symbol, would_have_tier, tier_name, block_time,
+                block_reason, fee_gate_log_id, no_fee_data
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            token_address, symbol, would_have_tier, tier_name, block_time,
+            block_reason, fee_gate_log_id, 1 if no_fee_data else 0,
+        ))
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def mark_token_blocked(address: str, db_path: str = DB_PATH):
+    """Set status=BLOCKED for a token (terminal state). Bumps last_price_update."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE tokens SET status = ?, last_price_update = ? WHERE address = ?",
+            (TokenStatus.BLOCKED.value, time.time(), address),
+        )
+        await db.commit()
+
+
+# ── LP Floor shadow log ──────────────────────────────────────────────────────
+
+async def log_lp_floor(
+    token_address: str,
+    symbol: str,
+    alert_tier: int,
+    tier_name: str,
+    alert_time: float,
+    liquidity_usd: float,
+    label: str,
+    reason: str,
+    db_path: str = DB_PATH,
+):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            INSERT INTO lp_floor_log (
+                token_address, symbol, alert_tier, tier_name, alert_time,
+                liquidity_usd, label, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            token_address, symbol, alert_tier, tier_name, alert_time,
+            liquidity_usd, label, reason,
+        ))
+        await db.commit()
+
+# ── Ante shadow log ──────────────────────────────────────────────────────────
+
+async def log_ante(
+    token_address: str,
+    symbol: str,
+    alert_tier: int,
+    tier_name: str,
+    alert_time: float,
+    n20_count: int,
+    n20_median: float | None,
+    n20_p25: float | None,
+    n20_p75: float | None,
+    n20_width: float | None,
+    m5_count: int,
+    m5_median: float | None,
+    m5_p25: float | None,
+    m5_p75: float | None,
+    m5_width: float | None,
+    base_fee_coverage: float,
+    db_path: str = DB_PATH,
+):
+    """Insert one ante_log row. Observe-only shadow mode — never gates."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            INSERT INTO ante_log (
+                token_address, symbol, alert_tier, tier_name, alert_time,
+                ante_n20_count, ante_n20_median_sol, ante_n20_p25_sol, ante_n20_p75_sol,
+                ante_n20_width_ratio,
+                ante_5m_count, ante_5m_median_sol, ante_5m_p25_sol, ante_5m_p75_sol,
+                ante_5m_width_ratio,
+                base_fee_coverage
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            token_address, symbol, alert_tier, tier_name, alert_time,
+            n20_count, n20_median, n20_p25, n20_p75, n20_width,
+            m5_count, m5_median, m5_p25, m5_p75, m5_width,
+            base_fee_coverage,
+        ))
+        await db.commit()
+
+
+async def get_worst_fee_gate_label(
+    token_address: str,
+    db_path: str = DB_PATH,
+) -> tuple[int, str]:
+    """
+    Return the highest (worst) fee gate score ever recorded for this token.
+    Returns (max_score, worst_label). Returns (0, 'Normal') if no history.
+    """
+    if not os.path.exists(db_path):
+        return 0, "Normal"
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT MAX(score), label FROM fee_gate_log WHERE token_address = ? ORDER BY score DESC LIMIT 1",
+            (token_address,),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if row and row[0] is not None:
+        return row[0], row[1]
+    return 0, "Normal"

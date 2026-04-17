@@ -9,9 +9,10 @@ from typing import Optional
 
 class TokenStatus(str, Enum):
     TRACKING      = "tracking"       # Watching for ATH + dips
-    ATH_CONFIRMED = "ath_confirmed"  # Hit 1.2x from migration, dip alerts active
+    ATH_CONFIRMED = "ath_confirmed"  # Pump multiple threshold reached (see config.tracking.min_pump_multiple); dip alerts active
     ALERTED       = "alerted"        # At least one dip alert sent
     EXPIRED       = "expired"        # Too old, stop tracking
+    BLOCKED       = "blocked"        # Hard-blocked from alerts (e.g. SCAM Likely). Terminal state.
 
 
 @dataclass

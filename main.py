@@ -5,6 +5,9 @@ Entry point. Runs:
   1. Migration WebSocket — real-time pump.fun → PumpSwap migration detection
   2. Price tracker       — updates prices + ATH for all tracked tokens
   3. Alert trigger       — fires Telegram alerts at dip tiers
+  4. Periodic backfill   — safety net polling for missed WebSocket events
+  5. Daily recap         — posts performance summary to Telegram at midnight CST
+  6. Command listener    — responds to /stats, /perf, /perf7 in Telegram
 """
 
 import asyncio
@@ -12,16 +15,20 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone, timedelta
 
 import aiohttp
 import yaml
 
 import database as db
 from modules.migration_ws      import MigrationWebSocket
-from modules.backfill           import backfill_recent_migrations
+from modules.backfill           import backfill_recent_migrations, periodic_backfill_loop
 from modules.price_tracker      import PriceTracker
 from modules.alert_trigger      import AlertTrigger
 from modules.telegram_sender    import TelegramSender
+from modules                    import alert_gate
+from snapshot_holders            import snapshot_top_holders
+from holder_filter               import evaluate_holder_filter, log_holder_filter, get_recent_filter_result
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -33,6 +40,8 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("main")
+
+CST = timezone(timedelta(hours=-6))
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -49,47 +58,270 @@ async def price_alert_loop(
     session: aiohttp.ClientSession,
     db_path: str,
 ):
-    """Loop that updates prices, checks dip alert tiers, and processes retry queue."""
-    price_interval = config.get("tracking", {}).get("poll_interval_seconds", 30)
+    """Loop that updates prices, checks dip alert tiers, and processes retry queue.
+
+    Cadence split (Part 2 shadow mode):
+      - Loop tick: every SHADOW_LOOP_INTERVAL_S seconds (10s).
+      - Dexscreener poll + retry queues: every DEX_CYCLE_MOD cycles (~30s —
+        matches config.tracking.poll_interval_seconds so external API load
+        is unchanged from pre-shadow behaviour).
+      - gRPC shadow peak lookup (fresh tokens): every tick (local SQLite).
+      - Alert trigger: every tick, unchanged behaviour. ath_price is still
+        Dex-sourced; gRPC is observe-only.
+    """
+    # Match Dex cadence to the legacy poll interval so external API load
+    # stays identical to pre-shadow behaviour.
+    SHADOW_LOOP_INTERVAL_S = 10
+    dex_poll_interval = config.get("tracking", {}).get("poll_interval_seconds", 30)
+    DEX_CYCLE_MOD = max(1, round(dex_poll_interval / SHADOW_LOOP_INTERVAL_S))
+
+    cycle_count = 0
 
     while True:
         try:
             tokens = await db.load_all_tokens(db_path)
 
             if tokens:
-                # Update prices
-                newly_confirmed = await tracker.update_prices(tokens, session)
-                if newly_confirmed:
-                    logger.info(
-                        f"✅ {len(newly_confirmed)} token(s) crossed 1.5x threshold"
-                    )
-
-                # Reload after saves (status may have changed)
-                tokens = await db.load_all_tokens(db_path)
+                # ── Dexscreener poll (every DEX_CYCLE_MOD cycles) ─────
+                # External API — gated to preserve the ~30s cadence and
+                # avoid rate limits. The 10s tick only speeds up local
+                # gRPC peak reads, not Dexscreener.
+                if cycle_count % DEX_CYCLE_MOD == 0:
+                    newly_confirmed = await tracker.update_prices(tokens, session)
+                    if newly_confirmed:
+                        logger.info(
+                            f"✅ {len(newly_confirmed)} token(s) crossed {tracker.min_pump_multiple}x threshold"
+                        )
+                    # Reload after saves (status may have changed)
+                    tokens = await db.load_all_tokens(db_path)
 
                 # Check dip tiers
                 to_alert = trigger.check_tokens(tokens)
                 for token, tier in to_alert:
-                    tier_index = config.get("dip_tiers", []).index(tier)
+                    tier_index = tier["index"]
                     logger.info(
                         f"🔔 Alerting ${token.symbol} | "
                         f"{tier['name']} | -{token.drop_from_ath*100:.0f}% from ATH"
                     )
-                    await sender.send_dip_alert(token, tier, session)
-                    await trigger.mark_alerted(token, tier_index)
+                    ghost_filter_result = None
+                    ping_ts = time.time()
 
-            # Process retry queue for tokens Dexscreener wasn't ready for
-            try:
-                await migration_ws.process_retry_queue()
-            except Exception as e:
-                logger.error(f"Retry queue error: {e}")
+                    gate_result = await alert_gate.evaluate(
+                        token, tier, ping_ts, sender, db, config
+                    )
+                    if not gate_result.allow:
+                        logger.info(
+                            f"Alert blocked: ${token.symbol} ({token.address}) "
+                            f"tier={tier_index} reason={gate_result.block_reason}"
+                        )
+                        continue
+
+                    if tier_index == 0:
+                        # T1: always live snapshot + filter
+                        snapshot = await snapshot_top_holders(
+                            token_mint=token.address,
+                            tier="T1",
+                            ping_time=ping_ts,
+                            pool_address=token.pool_address,
+                            symbol=token.symbol,
+                            decimals=6,
+                        )
+                        if (snapshot.get("snapshot_status") != "error"
+                                and snapshot.get("holders")):
+                            ghost_filter_result = evaluate_holder_filter(snapshot)
+                            await log_holder_filter(
+                                token_address=token.address,
+                                alert_time=ping_ts,
+                                snapshot_id=None,
+                                result=ghost_filter_result,
+                            )
+
+                    else:
+                        # T2/T3: carry forward if fresh, else live refresh
+                        cached = await get_recent_filter_result(token.address)
+                        if cached is not None:
+                            ghost_filter_result = cached
+                        else:
+                            tier_label = f"T{tier_index + 1}"
+                            snapshot = await snapshot_top_holders(
+                                token_mint=token.address,
+                                tier=tier_label,
+                                ping_time=ping_ts,
+                                pool_address=token.pool_address,
+                                symbol=token.symbol,
+                                decimals=6,
+                            )
+                            if (snapshot.get("snapshot_status") != "error"
+                                    and snapshot.get("holders")):
+                                ghost_filter_result = evaluate_holder_filter(snapshot)
+                                await log_holder_filter(
+                                    token_address=token.address,
+                                    alert_time=ping_ts,
+                                    snapshot_id=None,
+                                    result=ghost_filter_result,
+                                )
+
+                    await sender.send_dip_alert(
+                        token, tier, session,
+                        ghost_filter_result=ghost_filter_result,
+                        fee_eval=gate_result.fee_eval,
+                    )
+                    await trigger.mark_alerted(token, tier_index, alert_time=ping_ts)
+
+            # Process retry queues on the Dex cadence only — both call
+            # external APIs (Dexscreener + Birdeye). Keeping them at the
+            # pre-shadow frequency means shadow mode adds zero new
+            # external-API load.
+            if cycle_count % DEX_CYCLE_MOD == 0:
+                try:
+                    await migration_ws.process_retry_queue()
+                except Exception as e:
+                    logger.error(f"Retry queue error: {e}")
+
+                try:
+                    await migration_ws.process_ath_retry_queue()
+                except Exception as e:
+                    logger.error(f"ATH retry queue error: {e}")
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error(f"Price/alert loop error: {e}")
 
-        await asyncio.sleep(price_interval)
+        cycle_count += 1
+        await asyncio.sleep(SHADOW_LOOP_INTERVAL_S)
+
+
+async def daily_recap_loop(
+    sender: TelegramSender,
+    session: aiohttp.ClientSession,
+    db_path: str,
+):
+    """Posts daily performance recap at midnight CST."""
+    logger.info("📊 Daily recap loop started (midnight CST)")
+
+    while True:
+        try:
+            # Calculate seconds until next midnight CST
+            now_cst = datetime.now(CST)
+            tomorrow_midnight = now_cst.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(days=1)
+            seconds_until = (tomorrow_midnight - now_cst).total_seconds()
+
+            logger.info(
+                f"📊 Next daily recap in {seconds_until / 3600:.1f} hours"
+            )
+            await asyncio.sleep(seconds_until)
+
+            # It's midnight CST — pull last 24h of alerts
+            since = time.time() - 86400
+            alerts = await db.get_alerts_since(since, db_path)
+
+            if not alerts:
+                logger.info("📊 No alerts in last 24h, skipping recap")
+                continue
+
+            # Build lookup of current token data for live prices
+            tokens = await db.load_all_tokens(db_path)
+            tokens_lookup = {
+                t.address: {
+                    "current_price": t.current_price,
+                    "current_mcap": t.current_mcap,
+                }
+                for t in tokens
+            }
+
+            await sender.send_daily_recap(alerts, tokens_lookup, session)
+            logger.info(f"📊 Daily recap sent ({len(alerts)} alerts)")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Daily recap error: {e}")
+            # Don't sleep the full day on error, retry in 5 min
+            await asyncio.sleep(300)
+
+
+async def command_listener_loop(
+    sender: TelegramSender,
+    session: aiohttp.ClientSession,
+    db_path: str,
+):
+    """Polls Telegram for commands and responds."""
+    logger.info("🎮 Command listener started")
+
+    # Small delay to let startup finish
+    await asyncio.sleep(5)
+
+    while True:
+        try:
+            commands = await sender.poll_commands(session)
+
+            for cmd_data in commands:
+                cmd = cmd_data["command"]
+
+                if cmd in ("/stats", "/perf"):
+                    # Last 24h performance
+                    await _send_perf_recap(sender, session, db_path, days=1)
+
+                elif cmd in ("/perf7", "/perf 7", "/stats7"):
+                    # Last 7 days performance
+                    await _send_perf_recap(sender, session, db_path, days=7)
+                
+                elif cmd.startswith("/prim"):
+                    parts = cmd.split()
+                    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
+                    await sender.send_prim_report(session, days)
+
+                elif cmd == "/help":
+                        help_msg = (
+                            "🤖 <b>Phoenix Bot Commands</b>\n"
+                            "\n"
+                            "/stats — Last 24h performance recap\n"
+                            "/perf — Same as /stats\n"
+                            "/perf7 — Last 7 days performance\n"
+                            "/prim — Primitive report (last 7d, or /prim 14)\n"
+                            "/help — Show this message"
+                        )
+                        await sender._send(help_msg, session)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Command listener error: {e}")
+
+        await asyncio.sleep(3)  # poll every 3 seconds
+
+
+async def _send_perf_recap(
+    sender: TelegramSender,
+    session: aiohttp.ClientSession,
+    db_path: str,
+    days: int,
+):
+    """Build and send performance recap for the given number of days."""
+    since = time.time() - (days * 86400)
+    alerts = await db.get_alerts_since(since, db_path)
+
+    if not alerts:
+        period = "24 hours" if days == 1 else f"{days} days"
+        await sender._send(f"📊 No alerts in the last {period}.", session)
+        return
+
+    tokens = await db.load_all_tokens(db_path)
+    tokens_lookup = {
+        t.address: {
+            "current_price": t.current_price,
+            "current_mcap": t.current_mcap,
+        }
+        for t in tokens
+    }
+
+    await sender.send_daily_recap(alerts, tokens_lookup, session)
+
+
+from modules.grpc_indexer import run_grpc_indexer
 
 
 async def main():
@@ -98,6 +330,10 @@ async def main():
     # Init DB
     db_path = config.get("database", {}).get("path", "data/bot.db")
     await db.init_db(db_path)
+
+    # ── ATH refresh shadow (logging-only, auto-disables after 48h) ────────
+    from modules import ath_refresh_shadow
+    await ath_refresh_shadow.startup_check(db_path, config)
 
     # Init modules
     migration_ws = MigrationWebSocket(config)
@@ -116,10 +352,14 @@ async def main():
         except Exception as e:
             logger.error(f"Backfill error (continuing anyway): {e}")
 
-        # Run migration websocket and price/alert loop as parallel tasks
+        # Run all loops as parallel tasks
         await asyncio.gather(
             migration_ws.run(session),
             price_alert_loop(migration_ws, tracker, trigger, sender, config, session, db_path),
+            periodic_backfill_loop(config, session),
+            daily_recap_loop(sender, session, db_path),
+            command_listener_loop(sender, session, db_path),
+            run_grpc_indexer(),
         )
 
 

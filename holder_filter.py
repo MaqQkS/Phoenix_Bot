@@ -126,15 +126,28 @@ async def _ensure_table(db_conn: aiosqlite.Connection) -> None:
             user_wallet_count        INTEGER,
             block_reason             TEXT,
             would_have_blocked       INTEGER NOT NULL,
+            verdict                  TEXT,
             actually_blocked         INTEGER NOT NULL DEFAULT 0,
             payload_json             TEXT    NOT NULL
         )
     """)
+    # Migration: add verdict column on existing DBs that predate the 3-mode rule.
+    async with db_conn.execute("PRAGMA table_info(holder_filter_log)") as cur:
+        hfl_cols = [row[1] async for row in cur]
+    if "verdict" not in hfl_cols:
+        await db_conn.execute("ALTER TABLE holder_filter_log ADD COLUMN verdict TEXT")
+        await db_conn.commit()
+        logger.info("Migrated holder_filter_log: added verdict column")
     await db_conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_hflog_token ON holder_filter_log(token_address)"
     )
     await db_conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_hflog_time ON holder_filter_log(alert_time)"
+    )
+    # Index for verdict — placed after migration so it works on
+    # existing DBs that just got the column added above.
+    await db_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hflog_verdict ON holder_filter_log(verdict)"
     )
     await db_conn.commit()
 

@@ -187,13 +187,13 @@ async def log_holder_filter(
     alert_time: float,
     snapshot_id: int | None,
     result: dict,
-) -> None:
-    """Insert a holder_filter_log row. Shadow mode — actually_blocked always 0."""
+) -> int | None:
+    """Insert a holder_filter_log row. Returns the inserted row id, or None on failure."""
     try:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         async with aiosqlite.connect(DB_PATH) as db:
             await _ensure_table(db)
-            await db.execute(
+            cursor = await db.execute(
                 """
                 INSERT INTO holder_filter_log (
                     token_address, alert_time, snapshot_id,
@@ -216,8 +216,23 @@ async def log_holder_filter(
                 ),
             )
             await db.commit()
+            return cursor.lastrowid
     except Exception as e:
         logger.error(f"holder_filter_log write failed for {token_address[:8]}: {e}")
+        return None
+
+
+async def mark_actually_blocked(row_id: int) -> None:
+    """Set actually_blocked=1 on a holder_filter_log row by id."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE holder_filter_log SET actually_blocked = 1 WHERE id = ?",
+                (row_id,),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"mark_actually_blocked failed for row {row_id}: {e}")
 
 
 async def get_recent_filter_result(

@@ -28,7 +28,7 @@ from modules.alert_trigger      import AlertTrigger
 from modules.telegram_sender    import TelegramSender
 from modules                    import alert_gate
 from snapshot_holders            import snapshot_top_holders
-from holder_filter               import evaluate_holder_filter, log_holder_filter, get_recent_filter_result
+from holder_filter               import evaluate_holder_filter, log_holder_filter, get_recent_filter_result, mark_actually_blocked
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -104,6 +104,7 @@ async def price_alert_loop(
                         f"{tier['name']} | -{token.drop_from_ath*100:.0f}% from ATH"
                     )
                     ghost_filter_result = None
+                    hf_log_row_id = None
                     ping_ts = time.time()
 
                     gate_result = await alert_gate.evaluate(
@@ -129,7 +130,7 @@ async def price_alert_loop(
                         if (snapshot.get("snapshot_status") != "error"
                                 and snapshot.get("holders")):
                             ghost_filter_result = evaluate_holder_filter(snapshot)
-                            await log_holder_filter(
+                            hf_log_row_id = await log_holder_filter(
                                 token_address=token.address,
                                 alert_time=ping_ts,
                                 snapshot_id=None,
@@ -154,12 +155,31 @@ async def price_alert_loop(
                             if (snapshot.get("snapshot_status") != "error"
                                     and snapshot.get("holders")):
                                 ghost_filter_result = evaluate_holder_filter(snapshot)
-                                await log_holder_filter(
+                                hf_log_row_id = await log_holder_filter(
                                     token_address=token.address,
                                     alert_time=ping_ts,
                                     snapshot_id=None,
                                     result=ghost_filter_result,
                                 )
+
+                    # Suppress alerts when the ghost filter says block.
+                    # Cached payloads pre-Phase 1 lack `verdict`; mirror
+                    # the formatter's fallback so behavior is consistent.
+                    gf_verdict = None
+                    if ghost_filter_result is not None:
+                        gf_verdict = ghost_filter_result.get("verdict") or (
+                            "block" if ghost_filter_result.get("would_block") else "pass"
+                        )
+
+                    if gf_verdict == "block":
+                        logger.info(
+                            f"Alert suppressed: ${token.symbol} ({token.address}) "
+                            f"tier={tier_index} verdict=block"
+                            f"{' (cached)' if hf_log_row_id is None else ''}"
+                        )
+                        if hf_log_row_id is not None:
+                            await mark_actually_blocked(hf_log_row_id)
+                        continue
 
                     await sender.send_dip_alert(
                         token, tier, session,

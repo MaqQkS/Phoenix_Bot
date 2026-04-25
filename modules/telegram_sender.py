@@ -16,6 +16,7 @@ from models import TrackedToken
 from filters.fee_gate import score_fees, enforce_sticky
 from filters.lp_floor import score_lp
 from modules.ante_taxonomy import classify_both_windows
+from holder_filter import GHOST_CAUTION_WALLETS, GHOST_CAUTION_CLUSTERS
 import database
 
 DB_PATH = "data/bot.db"
@@ -794,8 +795,12 @@ class TelegramSender:
             gf = ghost_filter_result
             uwc = gf["user_wallet_count"]
             low_pct = (gf["low_sol_count"] / uwc * 100) if uwc > 0 else 0
+            # Cached payloads from before the 3-mode rollout lack `verdict`;
+            # derive a binary-equivalent value from would_block so they still
+            # render correctly during the 1-hour cache TTL after deploy.
+            verdict = gf.get("verdict") or ("block" if gf.get("would_block") else "pass")
 
-            if gf["would_block"]:
+            if verdict == "block":
                 if gf["block_reason"] == "both":
                     gf_read = "bundle suspected + low-sol cluster"
                 elif gf["block_reason"] == "funding_collisions":
@@ -808,6 +813,27 @@ class TelegramSender:
                     col_line += f" in {len(gf['collision_clusters'])} clusters"
 
                 lines.extend(["", "🕵️ <b>Ghost Filter: 🔴 WOULD BLOCK</b>", col_line])
+                for cl in gf["collision_clusters"][:4]:
+                    lines.append(f"  └ {cl['sol']:.4f} SOL × {cl['wallets']}")
+                lines.append(f"• Low SOL (&lt;0.1): {gf['low_sol_count']}/{uwc} ({low_pct:.0f}%)")
+                lines.append(f"• Read: {gf_read}")
+            elif verdict == "caution":
+                fund = gf["funding_collision_count"]
+                clust = len(gf["collision_clusters"])
+                fund_caution = fund >= GHOST_CAUTION_WALLETS
+                clust_caution = clust >= GHOST_CAUTION_CLUSTERS
+                if fund_caution and clust_caution:
+                    gf_read = "moderate funding collisions; elevated cluster count"
+                elif fund_caution:
+                    gf_read = "moderate funding collisions"
+                else:
+                    gf_read = "elevated cluster count"
+
+                col_line = f"• Collisions: {fund} wallets"
+                if gf["collision_clusters"]:
+                    col_line += f" in {clust} clusters"
+
+                lines.extend(["", "🕵️ <b>Ghost Filter: ⚠️ CAUTION</b>", col_line])
                 for cl in gf["collision_clusters"][:4]:
                     lines.append(f"  └ {cl['sol']:.4f} SOL × {cl['wallets']}")
                 lines.append(f"• Low SOL (&lt;0.1): {gf['low_sol_count']}/{uwc} ({low_pct:.0f}%)")

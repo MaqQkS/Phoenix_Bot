@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from models import TrackedToken
 from filters.fee_gate import score_fees, enforce_sticky
 from filters.lp_floor import score_lp
-from modules.ante_taxonomy import classify_both_windows, classify_v2_both_windows
+from modules.ante_taxonomy import classify_both_windows
 import database
 
 DB_PATH = "data/bot.db"
@@ -734,7 +734,6 @@ class TelegramSender:
                     # of numeric Ante. Disagreement between windows is itself
                     # signal — render both regardless.
                     taxonomy = None
-                    taxonomy_v2 = None
                     if self.ante_taxonomy_cfg:
                         try:
                             stats_5m = {
@@ -754,28 +753,9 @@ class TelegramSender:
                             taxonomy = classify_both_windows(
                                 stats_5m, stats_20sw, self.ante_taxonomy_cfg
                             )
-                            # V2 shadow classifier — raw width sample values,
-                            # not the 0-floored versions v1 uses. NULL width →
-                            # INSUFFICIENT (handled inside classify_v2).
-                            v2_threshold = self.ante_taxonomy_cfg.get(
-                                "v2_width_threshold", 4.88
-                            )
-                            v2_stats_5m = {
-                                "count":       ante["m5_count"],
-                                "width_ratio": ante["m5_width"],
-                            }
-                            v2_stats_20sw = {
-                                "count":       ante["n20_count"],
-                                "width_ratio": ante["n20_width"],
-                            }
-                            taxonomy_v2 = classify_v2_both_windows(
-                                v2_stats_5m, v2_stats_20sw, v2_threshold
-                            )
-                            v2_5m = taxonomy_v2["label_v2_5m"] if taxonomy_v2 and taxonomy_v2.get("label_v2_5m") else "n/a"
-                            v2_20sw = taxonomy_v2["label_v2_20sw"] if taxonomy_v2 and taxonomy_v2.get("label_v2_20sw") else "n/a"
                             lines.extend([
-                                f"• Shape (5m):   {taxonomy['label_5m']} (rule {taxonomy['rule_hit_5m']}) | v2: {v2_5m}",
-                                f"• Shape (20sw): {taxonomy['label_20sw']} (rule {taxonomy['rule_hit_20sw']}) | v2: {v2_20sw}",
+                                f"• Shape (5m):   {taxonomy['label_5m']} (rule {taxonomy['rule_hit_5m']})",
+                                f"• Shape (20sw): {taxonomy['label_20sw']} (rule {taxonomy['rule_hit_20sw']})",
                             ])
                         except Exception as e:
                             logger.warning(f"ante_taxonomy classify failed for {token.address[:8]}: {e}")
@@ -802,8 +782,6 @@ class TelegramSender:
                         rule_hit_5m=taxonomy["rule_hit_5m"] if taxonomy else None,
                         label_20sw=taxonomy["label_20sw"] if taxonomy else None,
                         rule_hit_20sw=taxonomy["rule_hit_20sw"] if taxonomy else None,
-                        label_v2_5m=taxonomy_v2["label_v2_5m"] if taxonomy_v2 else None,
-                        label_v2_20sw=taxonomy_v2["label_v2_20sw"] if taxonomy_v2 else None,
                         median_priority_fee=pf_median,
                         priority_fee_n=pf_count,
                     )

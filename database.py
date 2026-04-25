@@ -345,21 +345,6 @@ async def init_db(db_path: str = DB_PATH):
             await db.commit()
             logger.info("Migrated ante_log: added ante_5m_width_ratio column")
 
-        # ── Migration: Ante v2 shadow classifier labels on ante_log ──
-        # Parallel shadow classifier using a single width threshold
-        # (v2_width_threshold in config). Both nullable. NULL means v2 did
-        # not run (e.g. ante_taxonomy block absent or prior-to-migration rows).
-        async with db.execute("PRAGMA table_info(ante_log)") as cur:
-            ante_cols = [row[1] async for row in cur]
-        if "label_v2_5m" not in ante_cols:
-            await db.execute("ALTER TABLE ante_log ADD COLUMN label_v2_5m TEXT")
-            await db.commit()
-            logger.info("Migrated ante_log: added label_v2_5m column")
-        if "label_v2_20sw" not in ante_cols:
-            await db.execute("ALTER TABLE ante_log ADD COLUMN label_v2_20sw TEXT")
-            await db.commit()
-            logger.info("Migrated ante_log: added label_v2_20sw column")
-
         # ── Migration: Ante v2 Session 2 — priority_fee observe-only columns
         # Both nullable (forward-only capture). median_priority_fee is lamports;
         # priority_fee_n is the non-NULL sample count (0–20).
@@ -981,8 +966,6 @@ async def log_ante(
     rule_hit_5m: int | None = None,
     label_20sw: str | None = None,
     rule_hit_20sw: int | None = None,
-    label_v2_5m: str | None = None,
-    label_v2_20sw: str | None = None,
     median_priority_fee: float | None = None,
     priority_fee_n: int | None = None,
     db_path: str = DB_PATH,
@@ -998,16 +981,14 @@ async def log_ante(
                 ante_5m_width_ratio,
                 base_fee_coverage,
                 label_5m, rule_hit_5m, label_20sw, rule_hit_20sw,
-                label_v2_5m, label_v2_20sw,
                 median_priority_fee, priority_fee_n
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             token_address, symbol, alert_tier, tier_name, alert_time,
             n20_count, n20_median, n20_p25, n20_p75, n20_width,
             m5_count, m5_median, m5_p25, m5_p75, m5_width,
             base_fee_coverage,
             label_5m, rule_hit_5m, label_20sw, rule_hit_20sw,
-            label_v2_5m, label_v2_20sw,
             median_priority_fee, priority_fee_n,
         ))
         await db.commit()

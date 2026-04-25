@@ -34,6 +34,13 @@ COLLISION_THRESHOLD = 6       # wallets in funding clusters to flag
 LOW_SOL_THRESHOLD = 30        # wallets with < 0.1 SOL to flag
 LOW_SOL_CUTOFF = 0.1          # SOL balance below this = "low SOL"
 
+# v2 thresholds — drive the 3-mode `verdict` field. Independent of v1
+# above (which still drives would_have_blocked for historical compat).
+GHOST_BLOCK_WALLETS    = 8
+GHOST_BLOCK_CLUSTERS   = 4
+GHOST_CAUTION_WALLETS  = 6
+GHOST_CAUTION_CLUSTERS = 3
+
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 
@@ -97,6 +104,28 @@ def evaluate_holder_filter(snapshot: dict) -> dict:
     elif flagged_low_sol:
         block_reason = "low_sol_cluster"
 
+    # ── 3-mode verdict (v2, independent of v1 would_block) ───────────────
+    cluster_count = len(clusters)
+    if (
+        funding_collision_count >= GHOST_BLOCK_WALLETS
+        or cluster_count >= GHOST_BLOCK_CLUSTERS
+    ):
+        collision_verdict = "block"
+    elif (
+        funding_collision_count >= GHOST_CAUTION_WALLETS
+        or cluster_count >= GHOST_CAUTION_CLUSTERS
+    ):
+        collision_verdict = "caution"
+    else:
+        collision_verdict = "pass"
+
+    if flagged_low_sol or collision_verdict == "block":
+        verdict = "block"
+    elif collision_verdict == "caution":
+        verdict = "caution"
+    else:
+        verdict = "pass"
+
     return {
         "funding_collision_count": funding_collision_count,
         "collision_clusters": clusters,
@@ -106,6 +135,7 @@ def evaluate_holder_filter(snapshot: dict) -> dict:
         "flagged_low_sol": flagged_low_sol,
         "would_block": would_block,
         "block_reason": block_reason,
+        "verdict": verdict,
         "checked_at": time.time(),
     }
 
@@ -168,9 +198,9 @@ async def log_holder_filter(
                 INSERT INTO holder_filter_log (
                     token_address, alert_time, snapshot_id,
                     funding_collision_count, low_sol_count, user_wallet_count,
-                    block_reason, would_have_blocked, actually_blocked,
+                    block_reason, would_have_blocked, verdict, actually_blocked,
                     payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 """,
                 (
                     token_address,
@@ -181,6 +211,7 @@ async def log_holder_filter(
                     result.get("user_wallet_count", 0),
                     result.get("block_reason"),
                     1 if result.get("would_block") else 0,
+                    result.get("verdict"),
                     json.dumps(result, default=str),
                 ),
             )

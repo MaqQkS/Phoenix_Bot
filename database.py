@@ -231,6 +231,11 @@ async def init_db(db_path: str = DB_PATH):
                 ante_5m_width_ratio   REAL,
                 -- Diagnostics
                 base_fee_coverage     REAL,
+                -- Taxonomy labels (V1) — categorical Ante classification per window
+                label_5m              TEXT,
+                rule_hit_5m           INTEGER,
+                label_20sw            TEXT,
+                rule_hit_20sw         INTEGER,
                 manual_verdict        TEXT,
                 reviewed_at           REAL
             )

@@ -302,6 +302,26 @@ async def init_db(db_path: str = DB_PATH):
             await db.commit()
             logger.info("Migrated ante_log: added ante_5m_width_ratio column")
 
+        # ── Migration: drawdown + timing columns on alerts ────────────────
+        # Post-alert outcome tracking. Forward-only: historical alerts stay
+        # NULL on all six columns — NULL means "we weren't tracking at the
+        # time," not "zero drawdown." Do not backfill alert_price as a
+        # synthetic floor; that would fabricate outcomes for rows we did
+        # not observe. Column-existence is the idempotency guard — do not
+        # use "any non-NULL trough_price_after" since the price loop
+        # populates it within seconds of deploy.
+        async with db.execute("PRAGMA table_info(alerts)") as cur:
+            alerts_cols = [row[1] async for row in cur]
+        if "trough_price_after" not in alerts_cols:
+            await db.execute("ALTER TABLE alerts ADD COLUMN trough_price_after REAL")
+            await db.execute("ALTER TABLE alerts ADD COLUMN trough_mcap_after REAL")
+            await db.execute("ALTER TABLE alerts ADD COLUMN trough_time REAL")
+            await db.execute("ALTER TABLE alerts ADD COLUMN peak_time REAL")
+            await db.execute("ALTER TABLE alerts ADD COLUMN time_to_peak_minutes REAL")
+            await db.execute("ALTER TABLE alerts ADD COLUMN max_drawdown_pct REAL")
+            await db.commit()
+            logger.info("Migrated alerts: added drawdown/timing columns")
+
     logger.info(f"Database initialised at {db_path}")
 
 
@@ -406,17 +426,58 @@ async def update_peak_after_alert(
     address: str,
     current_price: float,
     current_mcap: float,
+    current_time: float | None = None,
     db_path: str = DB_PATH,
 ):
-    """Update peak_price_after for all alerts on this token if current price is higher."""
+    """Update peak_price_after for all alerts on this token if current
+    price is higher. Also records peak_time and time_to_peak_minutes
+    when current_time is provided. current_time defaults to now() so
+    callers that predate the timing fields keep working."""
+    ts = current_time if current_time is not None else time.time()
+    async with aiosqlite.connect(db_path) as db:
+        # alert_time is a column ref, not a param — each row computes its
+        # own duration from its own alert_time (different tiers on the
+        # same token fire at different times).
+        await db.execute("""
+            UPDATE alerts
+            SET peak_price_after     = ?,
+                peak_mcap_after      = ?,
+                peak_time            = ?,
+                time_to_peak_minutes = (? - alert_time) / 60.0
+            WHERE address = ?
+              AND peak_price_after < ?
+        """, (
+            current_price, current_mcap, ts, ts,
+            address, current_price,
+        ))
+        await db.commit()
+
+
+async def update_trough_after_alert(
+    address: str,
+    current_price: float,
+    current_mcap: float,
+    current_time: float,
+    db_path: str = DB_PATH,
+):
+    """Update trough fields for all alerts on this token if current price
+    is lower than recorded trough (or trough is NULL — first write after
+    migration). max_drawdown_pct uses the row's alert_price column, not
+    a bound param, so different-tier alerts on the same token compute
+    their own drawdown."""
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""
             UPDATE alerts
-            SET peak_price_after = ?,
-                peak_mcap_after = ?
+            SET trough_price_after = ?,
+                trough_mcap_after  = ?,
+                trough_time        = ?,
+                max_drawdown_pct   = 1.0 - (? / alert_price)
             WHERE address = ?
-              AND peak_price_after < ?
-        """, (current_price, current_mcap, address, current_price))
+              AND (trough_price_after IS NULL OR trough_price_after > ?)
+        """, (
+            current_price, current_mcap, current_time,
+            current_price, address, current_price,
+        ))
         await db.commit()
 
 

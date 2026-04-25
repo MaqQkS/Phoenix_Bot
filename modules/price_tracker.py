@@ -124,6 +124,31 @@ class PriceTracker:
 
                 await db.save_token(token)
 
+                # ── Update peak/trough-after-alert for performance tracking ──
+                if token.status == TokenStatus.ALERTED:
+                    try:
+                        # Sanity check: ignore mcap spikes >50x from ATH (data glitch or manipulation)
+                        if token.ath_mcap > 0 and mcap > token.ath_mcap * 50:
+                            logger.warning(
+                                f"⚠️ ${token.symbol} mcap ${mcap:,.0f} is >50x ATH ${token.ath_mcap:,.0f} — skipping peak update"
+                            )
+                        else:
+                            now = time.time()
+                            await db.update_peak_after_alert(
+                                address=token.address,
+                                current_price=price,
+                                current_mcap=mcap,
+                                current_time=now,
+                            )
+                            await db.update_trough_after_alert(
+                                address=token.address,
+                                current_price=price,
+                                current_mcap=mcap,
+                                current_time=now,
+                            )
+                    except Exception as e:
+                        logger.debug(f"Peak update error for ${token.symbol}: {e}")
+
             except Exception as e:
                 logger.error(f"Price update error for ${token.symbol}: {e}")
 

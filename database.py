@@ -41,7 +41,10 @@ async def init_db(db_path: str = DB_PATH):
                 volume_24h      REAL,
                 migration_time  REAL,
                 last_price_update REAL,
-                last_alerted_tier INTEGER
+                last_alerted_tier INTEGER,
+                ath_source      TEXT DEFAULT 'unseeded',
+                pool_orientation TEXT DEFAULT NULL,
+                token_decimals  INTEGER DEFAULT NULL
             )
         """)
         await db.execute("""
@@ -71,6 +74,19 @@ async def init_db(db_path: str = DB_PATH):
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_pumpswap_fees_token
             ON pumpswap_fees(token_address)
+        """)
+        # Composite index for (token_address, block_time) range scans.
+        # Used by Ante 5m window and fee-gate 5m pace queries.
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pumpswap_fees_token_time
+            ON pumpswap_fees(token_address, block_time)
+        """)
+        # Composite index for Ante v2 priority_fee lookup: pool + event_type +
+        # block_time DESC lets get_median_priority_fee() use a bounded index
+        # scan instead of a full-pool scan + sort.
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pumpswap_fees_pool_buy_time
+            ON pumpswap_fees(pool_address, event_type, block_time DESC)
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
@@ -121,6 +137,9 @@ async def init_db(db_path: str = DB_PATH):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fgl_tier  ON fee_gate_log(alert_tier)")
 
         # ── Alert Block log (hard-block decisions) ────────────────────────
+        # retry_count / last_retry_at support the UPSERT in log_alert_block:
+        # first block writes retry_count=1, subsequent blocks on the same
+        # (token, tier, reason) key bump the count instead of inserting new rows.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS alert_block_log (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,6 +151,8 @@ async def init_db(db_path: str = DB_PATH):
                 block_reason     TEXT NOT NULL,
                 fee_gate_log_id  INTEGER,
                 no_fee_data      INTEGER NOT NULL DEFAULT 0,
+                retry_count      INTEGER NOT NULL DEFAULT 1,
+                last_retry_at    REAL,
                 FOREIGN KEY (token_address) REFERENCES tokens(address),
                 FOREIGN KEY (fee_gate_log_id) REFERENCES fee_gate_log(id)
             )
@@ -139,6 +160,10 @@ async def init_db(db_path: str = DB_PATH):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_abl_token  ON alert_block_log(token_address)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_abl_time   ON alert_block_log(block_time)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_abl_reason ON alert_block_log(block_reason)")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_block_dedup "
+            "ON alert_block_log(token_address, would_have_tier, block_reason)"
+        )
 
         # ── LP Floor shadow log ────────────────────────────────────────────
         await db.execute("""
@@ -288,6 +313,19 @@ async def init_db(db_path: str = DB_PATH):
             except Exception:
                 pass
 
+        # ── Migration: base_amount — pool-perspective base-side amount from
+        # BuyEvent/SellEvent offset 16. Forward-only capture; historical rows
+        # stay NULL. Note: for "inverted" pools where WSOL is the base side,
+        # this column holds the SOL amount instead of the meme-token amount —
+        # price-reconstruction consumers must pair it with quote_amount and
+        # the pool's base/quote orientation.
+        async with db.execute("PRAGMA table_info(pumpswap_fees)") as cur:
+            cols = [row[1] async for row in cur]
+        if "base_amount" not in cols:
+            await db.execute("ALTER TABLE pumpswap_fees ADD COLUMN base_amount INTEGER")
+            await db.commit()
+            logger.info("Migrated pumpswap_fees: added base_amount column")
+
         # ── Migration: Ante Phase 1.1 — width-ratio columns on ante_log ──
         # Both nullable. NULL means insufficient samples to compute (e.g. zero
         # swaps in window). Capped at 10000 in the producer to bound storage.
@@ -301,6 +339,72 @@ async def init_db(db_path: str = DB_PATH):
             await db.execute("ALTER TABLE ante_log ADD COLUMN ante_5m_width_ratio REAL")
             await db.commit()
             logger.info("Migrated ante_log: added ante_5m_width_ratio column")
+
+        # ── Migration: Ante v2 shadow classifier labels on ante_log ──
+        # Parallel shadow classifier using a single width threshold
+        # (v2_width_threshold in config). Both nullable. NULL means v2 did
+        # not run (e.g. ante_taxonomy block absent or prior-to-migration rows).
+        async with db.execute("PRAGMA table_info(ante_log)") as cur:
+            ante_cols = [row[1] async for row in cur]
+        if "label_v2_5m" not in ante_cols:
+            await db.execute("ALTER TABLE ante_log ADD COLUMN label_v2_5m TEXT")
+            await db.commit()
+            logger.info("Migrated ante_log: added label_v2_5m column")
+        if "label_v2_20sw" not in ante_cols:
+            await db.execute("ALTER TABLE ante_log ADD COLUMN label_v2_20sw TEXT")
+            await db.commit()
+            logger.info("Migrated ante_log: added label_v2_20sw column")
+
+        # ── Migration: Ante v2 Session 2 — priority_fee observe-only columns
+        # Both nullable (forward-only capture). median_priority_fee is lamports;
+        # priority_fee_n is the non-NULL sample count (0–20).
+        async with db.execute("PRAGMA table_info(ante_log)") as cur:
+            ante_cols = [row[1] async for row in cur]
+        if "median_priority_fee" not in ante_cols:
+            await db.execute("ALTER TABLE ante_log ADD COLUMN median_priority_fee REAL")
+            await db.commit()
+            logger.info("Migrated ante_log: added median_priority_fee column")
+        if "priority_fee_n" not in ante_cols:
+            await db.execute("ALTER TABLE ante_log ADD COLUMN priority_fee_n INTEGER")
+            await db.commit()
+            logger.info("Migrated ante_log: added priority_fee_n column")
+
+        # ── Migration: ath_source column on tokens ────────────────────────
+        # Tracks provenance of ath_price so the seed chain can't silently
+        # fall through to migration-era price without leaving a trace.
+        # Values: 'unseeded' | 'birdeye' | 'fallback' | 'running_max'.
+        async with db.execute("PRAGMA table_info(tokens)") as cur:
+            tokens_cols = [row[1] async for row in cur]
+        if "ath_source" not in tokens_cols:
+            await db.execute("ALTER TABLE tokens ADD COLUMN ath_source TEXT DEFAULT 'unseeded'")
+            # Backfill: provenance of pre-migration rows is unknowable.
+            # 'running_max' is the safe default — it won't re-enter the
+            # Birdeye retry loop on deploy (avoids a retry storm).
+            await db.execute(
+                "UPDATE tokens SET ath_source = 'running_max' WHERE ath_price > 0"
+            )
+            await db.execute(
+                "UPDATE tokens SET ath_source = 'unseeded' "
+                "WHERE ath_price IS NULL OR ath_price <= 0"
+            )
+            await db.commit()
+            logger.info("Migrated tokens: added ath_source column (backfilled)")
+
+        # ── Migration: pool_orientation + token_decimals on tokens ────────
+        # Populated by migration_ws at migration time via getAccountInfo.
+        # NULL means "not yet determined" — the gRPC indexer silently skips
+        # price derivation for tokens without metadata. Forward-only; no
+        # backfill for existing rows.
+        async with db.execute("PRAGMA table_info(tokens)") as cur:
+            tokens_cols = [row[1] async for row in cur]
+        if "pool_orientation" not in tokens_cols:
+            await db.execute("ALTER TABLE tokens ADD COLUMN pool_orientation TEXT DEFAULT NULL")
+            await db.commit()
+            logger.info("Migrated tokens: added pool_orientation column")
+        if "token_decimals" not in tokens_cols:
+            await db.execute("ALTER TABLE tokens ADD COLUMN token_decimals INTEGER DEFAULT NULL")
+            await db.commit()
+            logger.info("Migrated tokens: added token_decimals column")
 
         # ── Migration: drawdown + timing columns on alerts ────────────────
         # Post-alert outcome tracking. Forward-only: historical alerts stay
@@ -335,7 +439,8 @@ async def save_token(token: TrackedToken, db_path: str = DB_PATH):
                 :ath_price, :ath_mcap, :ath_time,
                 :volume_1h, :volume_6h, :volume_24h,
                 :migration_time, :last_price_update,
-                :last_alerted_tier
+                :last_alerted_tier, :ath_source,
+                :pool_orientation, :token_decimals
             )
         """, {
             "address":           token.address,
@@ -356,19 +461,22 @@ async def save_token(token: TrackedToken, db_path: str = DB_PATH):
             "migration_time":    token.migration_time,
             "last_price_update": token.last_price_update,
             "last_alerted_tier": token.last_alerted_tier,
+            "ath_source":        token.ath_source,
+            "pool_orientation":  token.pool_orientation,
+            "token_decimals":    token.token_decimals,
         })
         await db.commit()
 
 
 async def load_all_tokens(db_path: str = DB_PATH) -> list[TrackedToken]:
-    """Load all non-expired tokens from the database."""
+    """Load all active tokens (excludes EXPIRED and BLOCKED — both terminal states)."""
     if not os.path.exists(db_path):
         return []
     tokens = []
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM tokens WHERE status != 'expired'"
+            "SELECT * FROM tokens WHERE status NOT IN ('expired', 'blocked')"
         ) as cursor:
             async for row in cursor:
                 tokens.append(_row_to_token(row))
@@ -526,6 +634,25 @@ async def get_alerts_for_token(
 
 
 def _row_to_token(row) -> TrackedToken:
+    # ath_source may be missing on very old rows that predate the migration
+    # (shouldn't happen since init_db always runs first, but defensive).
+    try:
+        ath_source = row["ath_source"] or "unseeded"
+    except (IndexError, KeyError):
+        ath_source = "unseeded"
+
+    # pool_orientation / token_decimals were added after ath_source; defend
+    # against rows loaded via legacy codepaths that predate the migration.
+    try:
+        pool_orientation = row["pool_orientation"]
+    except (IndexError, KeyError):
+        pool_orientation = None
+
+    try:
+        token_decimals = row["token_decimals"]
+    except (IndexError, KeyError):
+        token_decimals = None
+
     return TrackedToken(
         address           = row["address"],
         symbol            = row["symbol"] or "???",
@@ -545,6 +672,9 @@ def _row_to_token(row) -> TrackedToken:
         migration_time    = row["migration_time"] or 0.0,
         last_price_update = row["last_price_update"] or 0.0,
         last_alerted_tier = row["last_alerted_tier"] if row["last_alerted_tier"] is not None else -1,
+        ath_source        = ath_source,
+        pool_orientation  = pool_orientation,
+        token_decimals    = token_decimals,
     )
 
 
@@ -620,6 +750,48 @@ async def get_pool_fees_total(
     }
 
 
+async def get_median_priority_fee(
+    pool_address: str,
+    before_time: float,
+    n: int = 20,
+    db_path: str = DB_PATH,
+) -> tuple[float | None, int]:
+    """
+    Median priority_fee (lamports) over the last `n` buy-side swaps for
+    `pool_address` with block_time <= `before_time`. Returns
+    (median, count_of_non_null_rows). Returns (None, 0) if no data.
+
+    Observe-only Ante v2 feature — logged, not gated.
+    """
+    if not os.path.exists(db_path):
+        return (None, 0)
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            """
+            SELECT priority_fee
+            FROM pumpswap_fees
+            WHERE pool_address = ?
+              AND event_type = 'buy'
+              AND block_time <= ?
+              AND priority_fee IS NOT NULL
+            ORDER BY block_time DESC
+            LIMIT ?
+            """,
+            (pool_address, before_time, n),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    if not rows:
+        return (None, 0)
+    values = sorted(r[0] for r in rows)
+    count = len(values)
+    mid = count // 2
+    if count % 2 == 1:
+        median = float(values[mid])
+    else:
+        median = (values[mid - 1] + values[mid]) / 2.0
+    return (median, count)
+
+
 async def save_pumpswap_fees_batch(
     records: list[dict],
     db_path: str = DB_PATH,
@@ -652,6 +824,7 @@ async def save_pumpswap_fees_batch(
             r.get("user_pubkey"),
             r.get("base_fee"),         # Ante Phase 1: tx-level, first-event-row only
             r.get("signature_count"),  # Ante Phase 1: tx-level, first-event-row only
+            r.get("base_amount"),
         )
         for r in records
     ]
@@ -661,8 +834,8 @@ async def save_pumpswap_fees_batch(
                 signature, slot, block_time, pool_address, token_address,
                 event_type, quote_amount, lp_fee, protocol_fee, creator_fee, total_fee, received_at,
                 priority_fee, jito_tip, compute_units_consumed, user_pubkey,
-                base_fee, signature_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                base_fee, signature_count, base_amount
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         await db.commit()
         return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
@@ -721,16 +894,25 @@ async def log_alert_block(
     no_fee_data: bool = False,
     db_path: str = DB_PATH,
 ) -> int:
-    """Insert one alert_block_log row. Returns the inserted row's id."""
+    """UPSERT one alert_block_log row, keyed on (token_address,
+    would_have_tier, block_reason). First block creates the row; subsequent
+    retries bump retry_count and last_retry_at while preserving the original
+    block_time as the first-seen timestamp."""
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute("""
             INSERT INTO alert_block_log (
                 token_address, symbol, would_have_tier, tier_name, block_time,
-                block_reason, fee_gate_log_id, no_fee_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                block_reason, fee_gate_log_id, no_fee_data,
+                retry_count, last_retry_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(token_address, would_have_tier, block_reason)
+            DO UPDATE SET
+                retry_count  = retry_count + 1,
+                last_retry_at = excluded.last_retry_at
         """, (
             token_address, symbol, would_have_tier, tier_name, block_time,
             block_reason, fee_gate_log_id, 1 if no_fee_data else 0,
+            block_time,
         ))
         await db.commit()
         return cursor.lastrowid
@@ -790,6 +972,14 @@ async def log_ante(
     m5_p75: float | None,
     m5_width: float | None,
     base_fee_coverage: float,
+    label_5m: str | None = None,
+    rule_hit_5m: int | None = None,
+    label_20sw: str | None = None,
+    rule_hit_20sw: int | None = None,
+    label_v2_5m: str | None = None,
+    label_v2_20sw: str | None = None,
+    median_priority_fee: float | None = None,
+    priority_fee_n: int | None = None,
     db_path: str = DB_PATH,
 ):
     """Insert one ante_log row. Observe-only shadow mode — never gates."""
@@ -801,13 +991,19 @@ async def log_ante(
                 ante_n20_width_ratio,
                 ante_5m_count, ante_5m_median_sol, ante_5m_p25_sol, ante_5m_p75_sol,
                 ante_5m_width_ratio,
-                base_fee_coverage
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                base_fee_coverage,
+                label_5m, rule_hit_5m, label_20sw, rule_hit_20sw,
+                label_v2_5m, label_v2_20sw,
+                median_priority_fee, priority_fee_n
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             token_address, symbol, alert_tier, tier_name, alert_time,
             n20_count, n20_median, n20_p25, n20_p75, n20_width,
             m5_count, m5_median, m5_p25, m5_p75, m5_width,
             base_fee_coverage,
+            label_5m, rule_hit_5m, label_20sw, rule_hit_20sw,
+            label_v2_5m, label_v2_20sw,
+            median_priority_fee, priority_fee_n,
         ))
         await db.commit()
 
@@ -831,3 +1027,5 @@ async def get_worst_fee_gate_label(
     if row and row[0] is not None:
         return row[0], row[1]
     return 0, "Normal"
+
+

@@ -50,6 +50,13 @@ class TrackedToken:
     # Which tier index (0/1/2) was last alerted. -1 = none yet.
     last_alerted_tier: int = -1
 
+    # ── Phantom-dip cooldown ──────────────────────────────────────────────
+    # Set by phantom_validator when Birdeye-current is at-or-near a freshly
+    # written ATH (BLICKY-class phantom). While time.time() < this value,
+    # alert_trigger.check_tokens() suppresses tier evaluation for the token.
+    # 0.0 = no cooldown active.
+    phantom_cooldown_until: float = 0.0
+
     # ── Computed properties ───────────────────────────────────────────────
     @property
     def pump_multiple(self) -> float:

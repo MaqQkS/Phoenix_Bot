@@ -44,7 +44,8 @@ async def init_db(db_path: str = DB_PATH):
                 last_alerted_tier INTEGER,
                 ath_source      TEXT DEFAULT 'unseeded',
                 pool_orientation TEXT DEFAULT NULL,
-                token_decimals  INTEGER DEFAULT NULL
+                token_decimals  INTEGER DEFAULT NULL,
+                phantom_cooldown_until REAL DEFAULT 0
             )
         """)
         await db.execute("""
@@ -280,6 +281,35 @@ async def init_db(db_path: str = DB_PATH):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_bgl_inception ON inspection_gate_log(inception_block_time)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_bgl_alert ON inspection_gate_log(alert_id)")
 
+        # ── Phantom Validator log (BLICKY phantom-dip detector) ───────────
+        # Logs every validator invocation (both phantom-positive and -negative)
+        # so the week-1 review can compute the true-positive / true-negative
+        # split and the birdeye_to_ath_ratio distribution.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS phantom_abort_log (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address            TEXT NOT NULL,
+                symbol                   TEXT,
+                ath_update_time          REAL NOT NULL,
+                ath_price                REAL NOT NULL,
+                ath_mcap                 REAL,
+                ath_source               TEXT,
+                birdeye_current_price    REAL,
+                birdeye_current_mcap     REAL,
+                dex_current_price        REAL,
+                dex_current_mcap         REAL,
+                birdeye_to_ath_ratio     REAL,
+                dex_to_ath_ratio         REAL,
+                is_phantom               INTEGER NOT NULL,
+                cooldown_until           REAL,
+                birdeye_error            TEXT,
+                created_at               REAL NOT NULL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pal_token ON phantom_abort_log(token_address)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pal_time  ON phantom_abort_log(ath_update_time)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_pal_phantom ON phantom_abort_log(is_phantom)")
+
         await db.commit()
 
         # ── Migration: add creator_fee column to pumpswap_fees if upgrading ─
@@ -396,6 +426,20 @@ async def init_db(db_path: str = DB_PATH):
             await db.commit()
             logger.info("Migrated tokens: added token_decimals column")
 
+        # ── Migration: phantom_cooldown_until on tokens ───────────────────
+        # Set by phantom_validator when Birdeye-current is at-or-near a
+        # freshly written ATH. alert_trigger reads this flag to suppress
+        # tier evaluation during the cooldown window. Default 0 = no
+        # cooldown active. Forward-only, no backfill.
+        async with db.execute("PRAGMA table_info(tokens)") as cur:
+            tokens_cols = [row[1] async for row in cur]
+        if "phantom_cooldown_until" not in tokens_cols:
+            await db.execute(
+                "ALTER TABLE tokens ADD COLUMN phantom_cooldown_until REAL DEFAULT 0"
+            )
+            await db.commit()
+            logger.info("Migrated tokens: added phantom_cooldown_until column")
+
         # ── Migration: drawdown + timing columns on alerts ────────────────
         # Post-alert outcome tracking. Forward-only: historical alerts stay
         # NULL on all six columns — NULL means "we weren't tracking at the
@@ -430,7 +474,8 @@ async def save_token(token: TrackedToken, db_path: str = DB_PATH):
                 :volume_1h, :volume_6h, :volume_24h,
                 :migration_time, :last_price_update,
                 :last_alerted_tier, :ath_source,
-                :pool_orientation, :token_decimals
+                :pool_orientation, :token_decimals,
+                :phantom_cooldown_until
             )
         """, {
             "address":           token.address,
@@ -454,6 +499,7 @@ async def save_token(token: TrackedToken, db_path: str = DB_PATH):
             "ath_source":        token.ath_source,
             "pool_orientation":  token.pool_orientation,
             "token_decimals":    token.token_decimals,
+            "phantom_cooldown_until": token.phantom_cooldown_until,
         })
         await db.commit()
 
@@ -643,6 +689,14 @@ def _row_to_token(row) -> TrackedToken:
     except (IndexError, KeyError):
         token_decimals = None
 
+    # phantom_cooldown_until added in Phase-2 phantom-dip fix; defend
+    # against rows loaded before the migration ran (edge case: tests
+    # using legacy fixtures).
+    try:
+        phantom_cooldown_until = row["phantom_cooldown_until"] or 0.0
+    except (IndexError, KeyError):
+        phantom_cooldown_until = 0.0
+
     return TrackedToken(
         address           = row["address"],
         symbol            = row["symbol"] or "???",
@@ -665,6 +719,7 @@ def _row_to_token(row) -> TrackedToken:
         ath_source        = ath_source,
         pool_orientation  = pool_orientation,
         token_decimals    = token_decimals,
+        phantom_cooldown_until = phantom_cooldown_until,
     )
 
 
@@ -992,6 +1047,50 @@ async def log_ante(
             median_priority_fee, priority_fee_n,
         ))
         await db.commit()
+
+
+# ── Phantom Validator log ────────────────────────────────────────────────────
+
+async def log_phantom_validation(
+    log_data: dict,
+    db_path: str = DB_PATH,
+) -> int:
+    """Insert one phantom_abort_log row.
+
+    `log_data` is the dict returned by phantom_validator.validate_*. Both
+    phantom-positive AND phantom-negative validations must be logged so the
+    week-1 review can compute the true-positive / true-negative ratio.
+    Returns the inserted row's id (lastrowid)."""
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""
+            INSERT INTO phantom_abort_log (
+                token_address, symbol, ath_update_time,
+                ath_price, ath_mcap, ath_source,
+                birdeye_current_price, birdeye_current_mcap,
+                dex_current_price, dex_current_mcap,
+                birdeye_to_ath_ratio, dex_to_ath_ratio,
+                is_phantom, cooldown_until, birdeye_error, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            log_data.get("token_address"),
+            log_data.get("symbol"),
+            log_data.get("ath_update_time"),
+            log_data.get("ath_price"),
+            log_data.get("ath_mcap"),
+            log_data.get("ath_source"),
+            log_data.get("birdeye_current_price"),
+            log_data.get("birdeye_current_mcap"),
+            log_data.get("dex_current_price"),
+            log_data.get("dex_current_mcap"),
+            log_data.get("birdeye_to_ath_ratio"),
+            log_data.get("dex_to_ath_ratio"),
+            int(bool(log_data.get("is_phantom"))),
+            log_data.get("cooldown_until"),
+            log_data.get("birdeye_error"),
+            log_data.get("created_at") or time.time(),
+        ))
+        await db.commit()
+        return cursor.lastrowid
 
 
 async def get_worst_fee_gate_label(

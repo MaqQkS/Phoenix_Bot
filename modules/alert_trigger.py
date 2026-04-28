@@ -15,6 +15,7 @@ Requirements before alerting:
 """
 
 import logging
+import time
 import database as db
 from models import TrackedToken, TokenStatus
 
@@ -42,6 +43,33 @@ class AlertTrigger:
                 continue
 
             if token.ath_price <= 0 or token.current_price <= 0:
+                continue
+
+            # ── Phantom-dip cooldown ───────────────────────────────────
+            # Suppress tier eval when phantom_validator flagged this token
+            # for cooldown after a Birdeye ATH update. Window is short
+            # (~120s) — long enough for Dexscreener cache to refresh.
+            now_ts = time.time()
+            if token.phantom_cooldown_until and now_ts < token.phantom_cooldown_until:
+                remaining = token.phantom_cooldown_until - now_ts
+                # Determine which tier this drop would have hit so the log
+                # captures what the fix actually prevented.
+                drop_preview = token.drop_from_ath
+                preview_tier_idx = -1
+                for i, tier in enumerate(self.tiers):
+                    if tier["min_drop"] <= drop_preview < tier["max_drop"]:
+                        preview_tier_idx = i
+                        break
+                if preview_tier_idx > token.last_alerted_tier:
+                    logger.info(
+                        f"⏸️  ${token.symbol} would-have-alerted Tier {preview_tier_idx + 1} "
+                        f"but phantom cooldown active (expires in {remaining:.0f}s)"
+                    )
+                else:
+                    logger.info(
+                        f"⏸️  ${token.symbol} tier eval suppressed (phantom cooldown, "
+                        f"{remaining:.0f}s remaining)"
+                    )
                 continue
 
             drop = token.drop_from_ath  # e.g. 0.72 = 72% drop

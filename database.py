@@ -22,6 +22,15 @@ async def init_db(db_path: str = DB_PATH):
     """Create tables if they don't exist."""
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     async with aiosqlite.connect(db_path) as db:
+        # Force WAL mode on every init so a fresh DB doesn't silently sit
+        # in DELETE mode (the SQLite default). Persistent on the file —
+        # subsequent connections inherit. Required for journal_size_limit
+        # and PRAGMA wal_checkpoint to do anything.
+        await db.execute("PRAGMA journal_mode=WAL")
+        # Cap WAL at 1 GB so a stuck checkpoint can't grow it unbounded.
+        # (We hit 154 GB twice from a long-locking cleanup query that
+        # blocked auto-checkpoint.)
+        await db.execute("PRAGMA journal_size_limit = 1073741824")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tokens (
                 address         TEXT PRIMARY KEY,

@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
+import aiosqlite
 import yaml
 
 import database as db
@@ -344,6 +345,38 @@ async def _send_perf_recap(
 from modules.grpc_indexer import run_grpc_indexer
 
 
+async def periodic_checkpoint_loop(db_path: str):
+    """Run a TRUNCATE WAL checkpoint every 30 minutes so the WAL can't
+    silently balloon between cleanup runs. TRUNCATE briefly blocks
+    writers (~ms for a healthy WAL) but always shrinks the file back to
+    zero pages — PASSIVE skips frames held by other writers, and with
+    the gRPC indexer writing constantly that meant PASSIVE rarely
+    truncated anything.
+
+    journal_size_limit is per-connection (NOT a persistent file property),
+    so we set it on this connection too. Otherwise the post-checkpoint
+    truncation step is a no-op and the WAL won't shrink even when the
+    checkpoint succeeds."""
+    while True:
+        await asyncio.sleep(1800)  # 30 minutes
+        try:
+            async with aiosqlite.connect(db_path) as db_conn:
+                await db_conn.execute("PRAGMA journal_size_limit = 1073741824")
+                result = await db_conn.execute_fetchall(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                )
+            wal_path = db_path.replace('.db', '.db-wal')
+            if os.path.exists(wal_path):
+                wal_mb = os.path.getsize(wal_path) / (1024 * 1024)
+                logger.info(f"Periodic checkpoint complete. WAL: {wal_mb:.1f} MB (result: {result})")
+                if wal_mb > 500:
+                    logger.warning(f"WAL is {wal_mb:.1f} MB — investigate if this persists")
+            else:
+                logger.info(f"Periodic checkpoint complete (no WAL file). result: {result}")
+        except Exception as e:
+            logger.error(f"Periodic checkpoint failed: {e}")
+
+
 async def main():
     config = load_config()
 
@@ -380,6 +413,7 @@ async def main():
             daily_recap_loop(sender, session, db_path),
             command_listener_loop(sender, session, db_path),
             run_grpc_indexer(),
+            periodic_checkpoint_loop(db_path),
         )
 
 

@@ -22,3 +22,18 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+bot.log
+
+# Logs (runtime)
+*.log
+*.log.*
+
+# Runtime data & state
+bot.db
+data/
+diagnostics_out/
+db_exports/
+launch_time.txt
+
+# Generated scratch (diagnostic scripts only — keep generated/*pb2*.py)
+generated/_readonly_*.py

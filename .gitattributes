@@ -1,0 +1,7 @@
+# Treat binary file types as binary regardless of content sniffing
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.db  binary
+*.bak binary

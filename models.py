@@ -36,6 +36,15 @@ class TrackedToken:
     ath_price: float = 0.0
     ath_mcap: float = 0.0
     ath_time: float = 0.0
+    # Provenance of ath_price. Values:
+    #   'unseeded'            — no Birdeye data yet
+    #   'birdeye'             — initial Birdeye seed accepted
+    #   'birdeye_reseeded'    — re-query found higher peak than initial seed
+    #   'birdeye_corrected'   — T+15m correction found higher peak
+    #   'birdeye_running_max' — running-max exceeded any Birdeye value
+    #   'running_max'         — Birdeye never succeeded, timeout
+    #   'fallback'            — legacy historical rows
+    ath_source: str = "unseeded"
 
     # ── Volume ────────────────────────────────────────────────────────────
     volume_1h: float = 0.0
@@ -56,6 +65,16 @@ class TrackedToken:
     # alert_trigger.check_tokens() suppresses tier evaluation for the token.
     # 0.0 = no cooldown active.
     phantom_cooldown_until: float = 0.0
+
+    # ── Pool metadata (fetched at migration time by migration_ws) ─────────
+    # Set once from getAccountInfo on the PumpSwap pool + SPL mint. Immutable
+    # after first write. NULL means "not yet determined" — the gRPC indexer
+    # skips price derivation for tokens without metadata.
+    #   pool_orientation: 'normal' (base=meme, quote=WSOL) |
+    #                     'inverted' (base=WSOL, quote=meme) | None
+    #   token_decimals:   SPL mint decimals (typically 6 for pump.fun)
+    pool_orientation: str | None = None
+    token_decimals: int | None = None
 
     # ── Computed properties ───────────────────────────────────────────────
     @property

@@ -2,6 +2,7 @@
 utils/dexscreener.py — Dexscreener API client.
 Handles price, mcap, liquidity, and volume.
 Free, no API key required.
+Supports bulk token fetching to minimize API calls.
 """
 
 import aiohttp
@@ -58,6 +59,59 @@ async def get_pumpswap_pair(token_address: str, session: aiohttp.ClientSession) 
     except Exception as e:
         logger.error(f"Dexscreener request failed for {token_address[:8]}: {e}")
     return None
+
+
+async def get_pumpswap_pairs_bulk(
+    token_addresses: list[str], session: aiohttp.ClientSession
+) -> dict[str, Optional[dict]]:
+    """
+    Fetch PumpSwap pairs for multiple tokens in a single API call.
+    Returns dict mapping address -> best PumpSwap pair (or None).
+    Dexscreener supports comma-separated addresses in one request.
+    """
+    result = {addr: None for addr in token_addresses}
+
+    if not token_addresses:
+        return result
+
+    # Dexscreener supports up to 30 addresses per call
+    addresses_str = ",".join(token_addresses)
+    url = f"{BASE_URL}/tokens/v1/solana/{addresses_str}"
+
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if not isinstance(data, list):
+                    return result
+
+                # Group pairs by base token address
+                pairs_by_token: dict[str, list[dict]] = {}
+                for pair in data:
+                    base_addr = pair.get("baseToken", {}).get("address", "")
+                    if base_addr in result:
+                        if base_addr not in pairs_by_token:
+                            pairs_by_token[base_addr] = []
+                        pairs_by_token[base_addr].append(pair)
+
+                # Pick best PumpSwap pair for each token
+                for addr, pairs in pairs_by_token.items():
+                    pumpswap = [p for p in pairs if p.get("dexId", "").lower() == "pumpswap"]
+                    if pumpswap:
+                        result[addr] = max(
+                            pumpswap,
+                            key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0,
+                        )
+
+            elif resp.status == 429:
+                logger.warning("Dexscreener rate limited (bulk)")
+            else:
+                logger.debug(f"Dexscreener bulk fetch status {resp.status}")
+
+    except Exception as e:
+        logger.error(f"Dexscreener bulk request failed: {e}")
+
+    return result
 
 
 def extract_price_data(pair: dict) -> dict:

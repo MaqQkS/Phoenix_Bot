@@ -99,15 +99,6 @@ async def get_ath_since_migration(
         logger.error(f"Birdeye OHLCV error for {token_address[:8]}: {e}")
 
     return None
-"""
-ADD THIS TO utils/birdeye.py — do not replace the file, append to it.
-
-New function: get_sol_price_at(timestamp, ...) with in-memory minute-bucket cache.
-
-Used by bundle_gate to convert SOL → USD at inception time.
-"""
-
-logger = logging.getLogger(__name__)
 
 # Native SOL mint address (Birdeye's identifier for SOL)
 SOL_MINT = "So11111111111111111111111111111111111111112"

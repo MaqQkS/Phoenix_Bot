@@ -28,6 +28,7 @@ from modules.price_tracker      import PriceTracker
 from modules.alert_trigger      import AlertTrigger
 from modules.telegram_sender    import TelegramSender
 from modules                    import alert_gate
+from modules.fast_dip_detector  import FastDipDetector
 from snapshot_holders            import snapshot_top_holders
 from holder_filter               import evaluate_holder_filter, log_holder_filter, get_recent_filter_result, mark_actually_blocked
 
@@ -393,6 +394,13 @@ async def main():
     tracker      = PriceTracker(config)
     trigger      = AlertTrigger(config)
     sender       = TelegramSender(config)
+    # Live fast-dip detector (Stage 1: trigger detection + shadow rows
+    # only — no decision gate, no Telegram). Backfill seeds the rolling-
+    # max windows from pumpswap_fees so the first live event has 60s of
+    # history to compare against.
+    fast_dip = FastDipDetector(db_path=db_path)
+    await fast_dip.startup()
+    fast_dip.start_periodic_refresh()
 
     logger.info("🚀 Dip Bot v2 starting up...")
 
@@ -412,7 +420,7 @@ async def main():
             periodic_backfill_loop(config, session),
             daily_recap_loop(sender, session, db_path),
             command_listener_loop(sender, session, db_path),
-            run_grpc_indexer(),
+            run_grpc_indexer(on_event=fast_dip.on_event),
             periodic_checkpoint_loop(db_path),
         )
 

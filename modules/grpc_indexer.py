@@ -16,6 +16,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Callable, Optional
 
 # Add ./generated to sys.path so the protoc-generated stubs can find each other
 # (geyser_pb2 imports solana_storage_pb2 with absolute imports — see project notes)
@@ -159,6 +160,10 @@ class GrpcIndexerStats:
         self.multi_sig_txs = 0
         self.last_log_ante_samples = 0
         self.last_log_ante_sum = 0
+        # Observer callback failures (e.g. fast_dip_detector). Counted
+        # but never propagated — the primary write path stays untouched.
+        self.callback_errors = 0
+        self.last_log_callback_errors = 0
 
 
 # Batching config
@@ -166,9 +171,22 @@ BATCH_MAX_SIZE = 100
 BATCH_MAX_AGE_SECONDS = 2.0
 
 
-async def _consume_stream(channel: grpc.aio.Channel, stats: GrpcIndexerStats):
+async def _consume_stream(
+    channel: grpc.aio.Channel,
+    stats: GrpcIndexerStats,
+    on_event: Optional[Callable[..., None]] = None,
+):
     """
     Open the Subscribe stream, decode PumpSwap fee events, batch-write to DB.
+
+    `on_event` is an optional non-mutating observer invoked once per
+    decoded fee event with the kwargs documented at the call site. It
+    is wrapped in try/except so a misbehaving observer cannot affect
+    the primary write path. Observers must NOT block: heavy work
+    should be dispatched onto the event loop via asyncio.create_task
+    inside the callback. The callback is called AFTER the event has
+    been queued for batch insert, so observer logic never delays the
+    DB write either.
     """
     stub = geyser_pb2_grpc.GeyserStub(channel)
     request = _build_subscribe_request()
@@ -289,10 +307,11 @@ async def _consume_stream(channel: grpc.aio.Channel, stats: GrpcIndexerStats):
         # One DB row per fee event in the tx
         for idx, (event_type, fees) in enumerate(fee_events):
             is_first = (idx == 0)
+            event_block_time = float(fees["timestamp"])
             pending.append({
                 "signature": signature_b58,
                 "slot": slot,
-                "block_time": float(fees["timestamp"]),
+                "block_time": event_block_time,
                 "pool_address": pool_address,
                 "token_address": token_mint,
                 "event_type": event_type,
@@ -309,6 +328,28 @@ async def _consume_stream(channel: grpc.aio.Channel, stats: GrpcIndexerStats):
                 "signature_count": sig_count if is_first else None,
             })
             stats.events_decoded += 1
+
+            # Notify observers (e.g. fast_dip_detector). Wrapped to
+            # guarantee detector failures never affect the write path.
+            if on_event is not None:
+                try:
+                    on_event(
+                        token_address=token_mint,
+                        pool_address=pool_address,
+                        block_time=event_block_time,
+                        quote_amount=fees["quote_amount"],
+                        base_amount=fees.get("base_amount"),
+                        event_type=event_type,
+                        signature=signature_b58,
+                    )
+                except Exception as cb_err:
+                    stats.callback_errors += 1
+                    # Log first few + every 100th to avoid log floods.
+                    if stats.callback_errors <= 5 or stats.callback_errors % 100 == 0:
+                        logger.warning(
+                            f"📡 on_event callback failed (#{stats.callback_errors}): "
+                            f"{type(cb_err).__name__}: {cb_err}"
+                        )
 
         now = time.time()
 
@@ -344,6 +385,8 @@ async def _consume_stream(channel: grpc.aio.Channel, stats: GrpcIndexerStats):
                 - stats.last_log_events_filtered
             )
             filt_tag = "dry-run filtered" if POOL_FILTER_DRY_RUN else "filtered"
+            cb_delta = stats.callback_errors - stats.last_log_callback_errors
+            cb_fragment = f", cb_errors={cb_delta}" if cb_delta else ""
             logger.info(
                 f"📡 gRPC: {stats.transactions_seen} txs, "
                 f"{stats.events_decoded} events decoded ({stats.events_persisted} persisted), "
@@ -351,6 +394,7 @@ async def _consume_stream(channel: grpc.aio.Channel, stats: GrpcIndexerStats):
                 f"{stats.decode_failures} decode failures, "
                 f"{filt_delta} {filt_tag} (non-primary pool, "
                 f"total={stats.events_filtered_non_primary_pool})"
+                f"{cb_fragment}"
                 f"{ante_fragment}"
             )
             stats.last_log_time = now
@@ -359,6 +403,7 @@ async def _consume_stream(channel: grpc.aio.Channel, stats: GrpcIndexerStats):
             stats.last_log_events_filtered = stats.events_filtered_non_primary_pool
             stats.last_log_ante_samples = stats.ante_samples
             stats.last_log_ante_sum = stats.ante_sum
+            stats.last_log_callback_errors = stats.callback_errors
             # Reset min/max per interval so we see fresh ranges each log
             stats.ante_min = None
             stats.ante_max = None
@@ -367,10 +412,12 @@ async def _consume_stream(channel: grpc.aio.Channel, stats: GrpcIndexerStats):
     await flush()
 
 
-async def run_grpc_indexer():
+async def run_grpc_indexer(on_event: Optional[Callable[..., None]] = None):
     """
     Top-level entry point. Connects, consumes stream, reconnects on failure
     with exponential backoff. Runs forever until cancelled.
+
+    `on_event` is forwarded to `_consume_stream` — see its docstring.
     """
     if not INDEXER_ENABLED:
         logger.info("📡 gRPC indexer disabled (GRPC_INDEXER_ENABLED != true), skipping startup")
@@ -393,7 +440,7 @@ async def run_grpc_indexer():
             logger.info("📡 gRPC channel ready, opening subscription stream")
             backoff = INITIAL_BACKOFF  # reset on successful connect
 
-            await _consume_stream(channel, stats)
+            await _consume_stream(channel, stats, on_event=on_event)
 
             # _consume_stream returning means the stream ended normally - reconnect
             logger.warning("📡 gRPC stream ended normally, reconnecting...")

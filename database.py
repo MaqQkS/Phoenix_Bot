@@ -319,6 +319,59 @@ async def init_db(db_path: str = DB_PATH):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_pal_time  ON phantom_abort_log(ath_update_time)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_pal_phantom ON phantom_abort_log(is_phantom)")
 
+        # ── Fast-Dip Detector shadow log (Stage 1: trigger only) ──────────
+        # One row per dip episode for a token. Stage 1 fills the trigger
+        # block + dip_end columns. Stage 2 will UPDATE the decision block
+        # at trigger_block_time + 10s. Stage 3 will UPDATE the outcome
+        # block with post-dip peak prices. All time math uses block_time.
+        # Prices are stored in SOL units (per-token, derived from
+        # quote_amount/base_amount); USD conversion is intentionally
+        # deferred to analysis time so the table is invariant to a
+        # SOL/USD constant choice.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fast_dip_shadow (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                -- Trigger (Stage 1) -----------------------------------------
+                token_address               TEXT NOT NULL,
+                pool_address                TEXT,
+                symbol                      TEXT,
+                trigger_block_time          REAL NOT NULL,
+                trigger_wall_time           REAL NOT NULL,
+                trigger_signature           TEXT,
+                trigger_event_type          TEXT,
+                trigger_price_sol           REAL NOT NULL,
+                rolling_max_price_sol       REAL NOT NULL,
+                rolling_max_block_time      REAL NOT NULL,
+                drop_pct                    REAL NOT NULL,
+                dip_end_block_time          REAL,
+                dip_end_reason              TEXT,
+
+                -- Decision (Stage 2 — populated by UPDATE later) ------------
+                decision_block_time         REAL,
+                decision_wall_time          REAL,
+                depth_at_10s                REAL,
+                depth_velocity_10s          REAL,
+                swap_count_10s              INTEGER,
+                buy_sell_ratio_10s          REAL,
+                pre_dip_1m_usd_vol          REAL,
+                trigger_lag_seconds         REAL,
+                suppressions                TEXT,
+                would_alert                 INTEGER,
+
+                -- Outcome (Stage 3 — populated by UPDATE later) -------------
+                post_60s_peak_price_sol     REAL,
+                post_5m_peak_price_sol      REAL,
+                post_60m_peak_price_sol     REAL,
+
+                -- Manual review (any stage) ---------------------------------
+                manual_verdict              TEXT,
+                reviewed_at                 REAL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fds_token        ON fast_dip_shadow(token_address)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fds_trigger_time ON fast_dip_shadow(trigger_block_time)")
+
         await db.commit()
 
         # ── Migration: add creator_fee column to pumpswap_fees if upgrading ─
@@ -1122,4 +1175,64 @@ async def get_worst_fee_gate_label(
         return row[0], row[1]
     return 0, "Normal"
 
+
+# ── Fast-Dip Detector shadow log ─────────────────────────────────────────────
+
+async def log_fast_dip_trigger(
+    token_address: str,
+    pool_address: str | None,
+    symbol: str | None,
+    trigger_block_time: float,
+    trigger_wall_time: float,
+    trigger_signature: str | None,
+    trigger_event_type: str | None,
+    trigger_price_sol: float,
+    rolling_max_price_sol: float,
+    rolling_max_block_time: float,
+    drop_pct: float,
+    db_path: str = DB_PATH,
+) -> int:
+    """Insert one fast_dip_shadow row at trigger time (Stage 1).
+
+    Returns the inserted row's id so the caller can hand it to
+    update_fast_dip_dip_end() when the dip episode resolves.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("""
+            INSERT INTO fast_dip_shadow (
+                token_address, pool_address, symbol,
+                trigger_block_time, trigger_wall_time,
+                trigger_signature, trigger_event_type,
+                trigger_price_sol, rolling_max_price_sol,
+                rolling_max_block_time, drop_pct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            token_address, pool_address, symbol,
+            trigger_block_time, trigger_wall_time,
+            trigger_signature, trigger_event_type,
+            trigger_price_sol, rolling_max_price_sol,
+            rolling_max_block_time, drop_pct,
+        ))
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def update_fast_dip_dip_end(
+    row_id: int,
+    dip_end_block_time: float,
+    dip_end_reason: str,
+    db_path: str = DB_PATH,
+):
+    """Stamp the dip-end columns on an existing fast_dip_shadow row.
+
+    `dip_end_reason` is one of: 'recovered' (live drop fell below 0.20),
+    'gap' (no swaps for 60s), 'evicted' (token bumped out of memory cap).
+    """
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE fast_dip_shadow SET dip_end_block_time = ?, dip_end_reason = ? "
+            "WHERE id = ?",
+            (dip_end_block_time, dip_end_reason, row_id),
+        )
+        await db.commit()
 

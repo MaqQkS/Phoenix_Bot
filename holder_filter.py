@@ -24,6 +24,8 @@ from typing import Optional
 
 import aiosqlite
 
+from database import db_connect
+
 logger = logging.getLogger("phoenix.holder_filter")
 
 DB_PATH = "data/bot.db"
@@ -191,7 +193,7 @@ async def log_holder_filter(
     """Insert a holder_filter_log row. Returns the inserted row id, or None on failure."""
     try:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect(DB_PATH) as db:
             await _ensure_table(db)
             cursor = await db.execute(
                 """
@@ -225,7 +227,7 @@ async def log_holder_filter(
 async def mark_actually_blocked(row_id: int) -> None:
     """Set actually_blocked=1 on a holder_filter_log row by id."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE holder_filter_log SET actually_blocked = 1 WHERE id = ?",
                 (row_id,),
@@ -246,7 +248,7 @@ async def get_recent_filter_result(
     is younger than max_age_seconds, otherwise None (caller should re-snapshot).
     """
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect(DB_PATH) as db:
             async with db.execute(
                 """
                 SELECT alert_time, payload_json

@@ -26,6 +26,8 @@ from typing import Optional
 
 import aiosqlite
 
+from database import db_connect
+
 logger = logging.getLogger(__name__)
 
 # ── Module-level state ────────────────────────────────────────────────────
@@ -39,7 +41,7 @@ _db_path: str = "data/bot.db"
 
 # ── Schema ────────────────────────────────────────────────────────────────
 async def _init_schema(db_path: str):
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS ath_refresh_shadow_log (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,7 +81,7 @@ async def startup_check(db_path: str, config: dict) -> bool:
 
     auto_h = _cfg.get("auto_disable_after_hours", 48)
     try:
-        async with aiosqlite.connect(db_path) as d:
+        async with db_connect(db_path) as d:
             async with d.execute(
                 "SELECT MIN(logged_at) FROM ath_refresh_shadow_log"
             ) as cur:
@@ -130,7 +132,7 @@ async def _write_row(**row):
     if not _enabled:
         return
     try:
-        async with aiosqlite.connect(_db_path) as d:
+        async with db_connect(_db_path) as d:
             await d.execute("""
                 INSERT INTO ath_refresh_shadow_log (
                     token_address, logged_at, event_type,
@@ -162,7 +164,7 @@ async def _log_session_start():
     """Write a session_start row and print cumulative session count."""
     prior = 0
     try:
-        async with aiosqlite.connect(_db_path) as d:
+        async with db_connect(_db_path) as d:
             async with d.execute(
                 "SELECT COUNT(*) FROM ath_refresh_shadow_log WHERE event_type='session_start'"
             ) as cur:
@@ -355,7 +357,7 @@ async def shadow_snapshot_loop(db_path: str):
 
     while _enabled:
         try:
-            async with aiosqlite.connect(db_path) as d:
+            async with db_connect(db_path) as d:
                 async with d.execute(
                     "SELECT status, COUNT(*) FROM tokens GROUP BY status"
                 ) as cur:

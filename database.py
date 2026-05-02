@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 
 from models import TrackedToken, TokenStatus
 
@@ -18,19 +19,36 @@ logger = logging.getLogger(__name__)
 DB_PATH = "data/bot.db"
 
 
+@asynccontextmanager
+async def db_connect(db_path: str = DB_PATH):
+    """Standard aiosqlite connection with concurrency PRAGMAs.
+    Use this everywhere instead of bare aiosqlite.connect() so every
+    connection gets busy_timeout (waits out brief writer locks instead
+    of failing) and synchronous=NORMAL (cheaper fsync, safe under WAL).
+    The persistent file-level pragmas (journal_mode=WAL,
+    journal_size_limit) are seeded once by init_db()."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA busy_timeout = 5000")
+        await db.execute("PRAGMA synchronous = NORMAL")
+        yield db
+
+
 async def init_db(db_path: str = DB_PATH):
     """Create tables if they don't exist."""
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     async with aiosqlite.connect(db_path) as db:
-        # Force WAL mode on every init so a fresh DB doesn't silently sit
-        # in DELETE mode (the SQLite default). Persistent on the file —
-        # subsequent connections inherit. Required for journal_size_limit
-        # and PRAGMA wal_checkpoint to do anything.
-        await db.execute("PRAGMA journal_mode=WAL")
-        # Cap WAL at 1 GB so a stuck checkpoint can't grow it unbounded.
-        # (We hit 154 GB twice from a long-locking cleanup query that
-        # blocked auto-checkpoint.)
-        await db.execute("PRAGMA journal_size_limit = 1073741824")
+        # Concurrency + size caps (prevents the WAL/lock blowup of
+        # 2026-05-02, where pumpswap_fees grew to 39 GB with a 19 GB
+        # WAL that never checkpointed). journal_mode + journal_size_limit
+        # are persistent on the DB file; busy_timeout + synchronous +
+        # wal_autocheckpoint are per-connection but seeding them here
+        # ensures the schema-creating connection is configured too —
+        # every other connection layers them on via db_connect().
+        await db.execute("PRAGMA journal_mode = WAL")
+        await db.execute("PRAGMA synchronous = NORMAL")
+        await db.execute("PRAGMA busy_timeout = 5000")
+        await db.execute("PRAGMA wal_autocheckpoint = 1000")
+        await db.execute("PRAGMA journal_size_limit = 1073741824")  # 1 GB hard cap
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tokens (
                 address         TEXT PRIMARY KEY,
@@ -526,7 +544,7 @@ async def init_db(db_path: str = DB_PATH):
 
 
 async def save_token(token: TrackedToken, db_path: str = DB_PATH):
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         await db.execute("""
             INSERT OR REPLACE INTO tokens VALUES (
                 :address, :symbol, :pool_address, :status,
@@ -571,7 +589,7 @@ async def load_all_tokens(db_path: str = DB_PATH) -> list[TrackedToken]:
     if not os.path.exists(db_path):
         return []
     tokens = []
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM tokens WHERE status NOT IN ('expired', 'blocked')"
@@ -584,7 +602,7 @@ async def load_all_tokens(db_path: str = DB_PATH) -> list[TrackedToken]:
 async def get_token(address: str, db_path: str = DB_PATH) -> TrackedToken | None:
     if not os.path.exists(db_path):
         return None
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM tokens WHERE address = ?", (address,)
@@ -613,7 +631,7 @@ async def save_alert(
 ):
     """Save an alert record when a dip alert fires."""
     ts = alert_time if alert_time is not None else time.time()
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         await db.execute("""
             INSERT INTO alerts (
                 address, symbol, tier_index, tier_name,
@@ -640,7 +658,7 @@ async def update_peak_after_alert(
     when current_time is provided. current_time defaults to now() so
     callers that predate the timing fields keep working."""
     ts = current_time if current_time is not None else time.time()
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         # alert_time is a column ref, not a param — each row computes its
         # own duration from its own alert_time (different tiers on the
         # same token fire at different times).
@@ -671,7 +689,7 @@ async def update_trough_after_alert(
     migration). max_drawdown_pct uses the row's alert_price column, not
     a bound param, so different-tier alerts on the same token compute
     their own drawdown."""
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         await db.execute("""
             UPDATE alerts
             SET trough_price_after = ?,
@@ -694,7 +712,7 @@ async def get_alerts_since(
     """Get all alerts fired since a given timestamp."""
     if not os.path.exists(db_path):
         return []
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM alerts WHERE alert_time >= ? ORDER BY alert_time DESC",
@@ -707,7 +725,7 @@ async def get_all_alerts(db_path: str = DB_PATH) -> list[dict]:
     """Get all alert records."""
     if not os.path.exists(db_path):
         return []
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM alerts ORDER BY alert_time DESC"
@@ -722,7 +740,7 @@ async def get_alerts_for_token(
     """Get all alerts for a specific token."""
     if not os.path.exists(db_path):
         return []
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM alerts WHERE address = ? ORDER BY alert_time ASC",
@@ -806,7 +824,7 @@ async def save_pumpswap_fee(
     import time as _time
     total_fee = lp_fee + protocol_fee + creator_fee
     try:
-        async with aiosqlite.connect(db_path) as db:
+        async with db_connect(db_path) as db:
             await db.execute("""
                 INSERT INTO pumpswap_fees (
                     signature, slot, block_time, pool_address, token_address,
@@ -835,7 +853,7 @@ async def get_pool_fees_total(
             "total_lp_fee": 0, "total_protocol_fee": 0, "total_creator_fee": 0,
             "total_fee": 0, "event_count": 0, "total_fee_sol": 0.0,
         }
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         async with db.execute("""
             SELECT
                 COALESCE(SUM(lp_fee), 0)       AS lp,
@@ -872,7 +890,7 @@ async def get_median_priority_fee(
     """
     if not os.path.exists(db_path):
         return (None, 0)
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         async with db.execute(
             """
             SELECT priority_fee
@@ -935,7 +953,7 @@ async def save_pumpswap_fees_batch(
         )
         for r in records
     ]
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         cursor = await db.executemany("""
             INSERT OR IGNORE INTO pumpswap_fees (
                 signature, slot, block_time, pool_address, token_address,
@@ -946,6 +964,23 @@ async def save_pumpswap_fees_batch(
         """, rows)
         await db.commit()
         return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+
+async def prune_old_pumpswap_fees(
+    retention_hours: int = 168,  # 7 days
+    db_path: str = DB_PATH,
+) -> int:
+    """Delete pumpswap_fees rows older than retention_hours.
+    Returns the number of rows deleted. Safe to call while bot is
+    running — uses block_time which is indexed via received_at fallback."""
+    cutoff = time.time() - (retention_hours * 3600)
+    async with db_connect(db_path) as db:
+        cursor = await db.execute(
+            "DELETE FROM pumpswap_fees WHERE received_at < ?",
+            (cutoff,),
+        )
+        await db.commit()
+        return cursor.rowcount or 0
 
 
 # ── Fee Gate shadow log ──────────────────────────────────────────────────────
@@ -972,7 +1007,7 @@ async def log_fee_gate(
     db_path: str = DB_PATH,
 ) -> int:
     """Insert one fee_gate_log row. Returns the inserted row's id (lastrowid)."""
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         cursor = await db.execute("""
             INSERT INTO fee_gate_log (
                 token_address, symbol, alert_tier, tier_name, alert_time,
@@ -1005,7 +1040,7 @@ async def log_alert_block(
     would_have_tier, block_reason). First block creates the row; subsequent
     retries bump retry_count and last_retry_at while preserving the original
     block_time as the first-seen timestamp."""
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         cursor = await db.execute("""
             INSERT INTO alert_block_log (
                 token_address, symbol, would_have_tier, tier_name, block_time,
@@ -1027,7 +1062,7 @@ async def log_alert_block(
 
 async def mark_token_blocked(address: str, db_path: str = DB_PATH):
     """Set status=BLOCKED for a token (terminal state). Bumps last_price_update."""
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         await db.execute(
             "UPDATE tokens SET status = ?, last_price_update = ? WHERE address = ?",
             (TokenStatus.BLOCKED.value, time.time(), address),
@@ -1048,7 +1083,7 @@ async def log_lp_floor(
     reason: str,
     db_path: str = DB_PATH,
 ):
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         await db.execute("""
             INSERT INTO lp_floor_log (
                 token_address, symbol, alert_tier, tier_name, alert_time,
@@ -1088,7 +1123,7 @@ async def log_ante(
     db_path: str = DB_PATH,
 ):
     """Insert one ante_log row. Observe-only shadow mode — never gates."""
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         await db.execute("""
             INSERT INTO ante_log (
                 token_address, symbol, alert_tier, tier_name, alert_time,
@@ -1123,7 +1158,7 @@ async def log_phantom_validation(
     phantom-positive AND phantom-negative validations must be logged so the
     week-1 review can compute the true-positive / true-negative ratio.
     Returns the inserted row's id (lastrowid)."""
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         cursor = await db.execute("""
             INSERT INTO phantom_abort_log (
                 token_address, symbol, ath_update_time,
@@ -1165,7 +1200,7 @@ async def get_worst_fee_gate_label(
     """
     if not os.path.exists(db_path):
         return 0, "Normal"
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         async with db.execute(
             "SELECT MAX(score), label FROM fee_gate_log WHERE token_address = ? ORDER BY score DESC LIMIT 1",
             (token_address,),
@@ -1197,7 +1232,7 @@ async def log_fast_dip_trigger(
     Returns the inserted row's id so the caller can hand it to
     update_fast_dip_dip_end() when the dip episode resolves.
     """
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         cursor = await db.execute("""
             INSERT INTO fast_dip_shadow (
                 token_address, pool_address, symbol,
@@ -1228,7 +1263,7 @@ async def update_fast_dip_dip_end(
     `dip_end_reason` is one of: 'recovered' (live drop fell below 0.20),
     'gap' (no swaps for 60s), 'evicted' (token bumped out of memory cap).
     """
-    async with aiosqlite.connect(db_path) as db:
+    async with db_connect(db_path) as db:
         await db.execute(
             "UPDATE fast_dip_shadow SET dip_end_block_time = ?, dip_end_reason = ? "
             "WHERE id = ?",

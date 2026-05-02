@@ -210,7 +210,7 @@ class FastDipDetector:
             return
 
         loaded_count = 0
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with db.db_connect(self._db_path) as conn:
             for addr in recent_tokens:
                 async with conn.execute(
                     """
@@ -288,7 +288,7 @@ class FastDipDetector:
     async def _refresh_token_scope(self, force: bool = False):
         if not force and (time.time() - self._token_scope_loaded_at) < CACHE_REFRESH_SEC:
             return
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with db.db_connect(self._db_path) as conn:
             placeholders = ",".join("?" for _ in WATCHED_STATUSES)
             async with conn.execute(
                 f"SELECT address FROM tokens WHERE status IN ({placeholders})",
@@ -301,7 +301,7 @@ class FastDipDetector:
     async def _refresh_symbol_cache(self, force: bool = False):
         if not force and (time.time() - self._symbol_cache_loaded_at) < CACHE_REFRESH_SEC:
             return
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with db.db_connect(self._db_path) as conn:
             async with conn.execute(
                 "SELECT address, symbol FROM tokens WHERE symbol IS NOT NULL"
             ) as cur:
@@ -323,7 +323,7 @@ class FastDipDetector:
         scope = list(self._token_scope)
         placeholders = ",".join("?" for _ in scope)
         params = (*scope, since_block_time, limit)
-        async with aiosqlite.connect(self._db_path) as conn:
+        async with db.db_connect(self._db_path) as conn:
             async with conn.execute(
                 f"""
                 SELECT token_address, MAX(block_time) AS last_block

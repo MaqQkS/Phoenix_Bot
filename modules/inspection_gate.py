@@ -28,6 +28,8 @@ import aiohttp
 import aiosqlite
 import yaml
 
+from database import db_connect
+
 from utils.birdeye import get_sol_price_at, get_sol_price_now
 
 logger = logging.getLogger(__name__)
@@ -76,7 +78,7 @@ async def check_inception_bundle(token_address: str, migration_slot: int) -> Non
     window_end = migration_slot + window_slots
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect(DB_PATH) as db:
             # Symbol for logging
             async with db.execute(
                 "SELECT symbol FROM tokens WHERE address = ?", (token_address,)
@@ -212,7 +214,7 @@ async def _write_log_row(
 ) -> None:
     """Insert one inspection_gate_log row. Reuses existing column names."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect(DB_PATH) as db:
             await db.execute(
                 """
                 INSERT INTO inspection_gate_log (

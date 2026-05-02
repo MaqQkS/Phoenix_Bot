@@ -346,6 +346,37 @@ async def _send_perf_recap(
 from modules.grpc_indexer import run_grpc_indexer
 
 
+async def pumpswap_fees_prune_loop(db_path: str):
+    """Prune pumpswap_fees rows older than 7 days. Runs hourly.
+
+    Added after the 2026-05-02 incident where pumpswap_fees grew
+    unbounded (millions of rows from grpc_indexer at ~14 evt/s) and
+    caused chronic lock contention. 7-day retention is the SCAM rework
+    working window; older fee history lives in cold storage."""
+    PRUNE_INTERVAL_SECONDS = 3600
+    RETENTION_HOURS = 168  # 7 days
+
+    # Initial delay so we don't slam the DB at startup
+    await asyncio.sleep(300)  # 5 min
+
+    while True:
+        try:
+            deleted = await db.prune_old_pumpswap_fees(
+                retention_hours=RETENTION_HOURS,
+                db_path=db_path,
+            )
+            if deleted > 0:
+                logger.info(
+                    f"🧹 Pruned {deleted} pumpswap_fees rows older than {RETENTION_HOURS}h"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Prune loop error: {e}")
+
+        await asyncio.sleep(PRUNE_INTERVAL_SECONDS)
+
+
 async def periodic_checkpoint_loop(db_path: str):
     """Run a TRUNCATE WAL checkpoint every 30 minutes so the WAL can't
     silently balloon between cleanup runs. TRUNCATE briefly blocks
@@ -361,7 +392,7 @@ async def periodic_checkpoint_loop(db_path: str):
     while True:
         await asyncio.sleep(1800)  # 30 minutes
         try:
-            async with aiosqlite.connect(db_path) as db_conn:
+            async with db.db_connect(db_path) as db_conn:
                 await db_conn.execute("PRAGMA journal_size_limit = 1073741824")
                 result = await db_conn.execute_fetchall(
                     "PRAGMA wal_checkpoint(TRUNCATE)"
@@ -422,6 +453,7 @@ async def main():
             command_listener_loop(sender, session, db_path),
             run_grpc_indexer(on_event=fast_dip.on_event),
             periodic_checkpoint_loop(db_path),
+            pumpswap_fees_prune_loop(db_path),
         )
 
 

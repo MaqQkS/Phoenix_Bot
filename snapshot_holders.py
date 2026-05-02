@@ -28,6 +28,8 @@ import aiohttp
 import aiosqlite
 import yaml
 
+from database import db_connect
+
 logger = logging.getLogger("phoenix.snapshot_holders")
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -509,7 +511,7 @@ async def _persist_snapshot(snapshot: Snapshot) -> None:
     # ── SQLite ────────────────────────────────────────────────────────────
     try:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        async with aiosqlite.connect(DB_PATH) as db_conn:
+        async with db_connect(DB_PATH) as db_conn:
             await _ensure_table(db_conn)
             await db_conn.execute(
                 """

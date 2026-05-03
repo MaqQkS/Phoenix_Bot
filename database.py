@@ -390,6 +390,19 @@ async def init_db(db_path: str = DB_PATH):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fds_token        ON fast_dip_shadow(token_address)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fds_trigger_time ON fast_dip_shadow(trigger_block_time)")
 
+        # ── Migration: Stage 2 +10s decision gate columns ────────────────
+        # swap_density_5s persisted at trigger time (was discarded in
+        # Stage 1). pre_dip_1m_swap_count populated by the +10s decision
+        # UPDATE. Both nullable. Stage 1 rows stay NULL — no backfill.
+        for col_sql in [
+            "ALTER TABLE fast_dip_shadow ADD COLUMN swap_density_5s REAL",
+            "ALTER TABLE fast_dip_shadow ADD COLUMN pre_dip_1m_swap_count INTEGER",
+        ]:
+            try:
+                await db.execute(col_sql)
+            except Exception:
+                pass
+
         await db.commit()
 
         # ── Migration: add creator_fee column to pumpswap_fees if upgrading ─
@@ -1225,12 +1238,18 @@ async def log_fast_dip_trigger(
     rolling_max_price_sol: float,
     rolling_max_block_time: float,
     drop_pct: float,
+    swap_density_5s: int,
+    trigger_lag_seconds: float,
     db_path: str = DB_PATH,
 ) -> int:
-    """Insert one fast_dip_shadow row at trigger time (Stage 1).
+    """Insert one fast_dip_shadow row at trigger time (Stage 1+2).
 
     Returns the inserted row's id so the caller can hand it to
-    update_fast_dip_dip_end() when the dip episode resolves.
+    update_fast_dip_dip_end() when the dip episode resolves and to
+    update_fast_dip_decision() when the +10s decision fires.
+
+    `trigger_lag_seconds` (= wall_clock - block_time at trigger) is set
+    once at INSERT and never modified by the +10s decision UPDATE.
     """
     async with db_connect(db_path) as db:
         cursor = await db.execute("""
@@ -1239,14 +1258,16 @@ async def log_fast_dip_trigger(
                 trigger_block_time, trigger_wall_time,
                 trigger_signature, trigger_event_type,
                 trigger_price_sol, rolling_max_price_sol,
-                rolling_max_block_time, drop_pct
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                rolling_max_block_time, drop_pct,
+                swap_density_5s, trigger_lag_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             token_address, pool_address, symbol,
             trigger_block_time, trigger_wall_time,
             trigger_signature, trigger_event_type,
             trigger_price_sol, rolling_max_price_sol,
             rolling_max_block_time, drop_pct,
+            swap_density_5s, trigger_lag_seconds,
         ))
         await db.commit()
         return cursor.lastrowid
@@ -1268,6 +1289,54 @@ async def update_fast_dip_dip_end(
             "UPDATE fast_dip_shadow SET dip_end_block_time = ?, dip_end_reason = ? "
             "WHERE id = ?",
             (dip_end_block_time, dip_end_reason, row_id),
+        )
+        await db.commit()
+
+
+async def update_fast_dip_decision(
+    row_id: int,
+    decision_block_time: float,
+    decision_wall_time: float,
+    depth_at_10s: float | None,
+    depth_velocity_10s: float | None,
+    swap_count_10s: int,
+    buy_sell_ratio_10s: float | None,
+    pre_dip_1m_usd_vol: float | None,
+    pre_dip_1m_swap_count: int,
+    suppressions: str | None,
+    would_alert: int,
+    db_path: str = DB_PATH,
+):
+    """Stamp the +10s decision-side columns on a fast_dip_shadow row (Stage 2).
+
+    Does NOT touch trigger_lag_seconds (set at INSERT and immutable here).
+    `suppressions` is a comma-separated list of fired rule ids, or NULL
+    if no rules fired. `would_alert` is 1 when zero rules fired, else 0.
+    """
+    async with db_connect(db_path) as db:
+        await db.execute(
+            """
+            UPDATE fast_dip_shadow
+            SET decision_block_time   = ?,
+                decision_wall_time    = ?,
+                depth_at_10s          = ?,
+                depth_velocity_10s    = ?,
+                swap_count_10s        = ?,
+                buy_sell_ratio_10s    = ?,
+                pre_dip_1m_usd_vol    = ?,
+                pre_dip_1m_swap_count = ?,
+                suppressions          = ?,
+                would_alert           = ?
+            WHERE id = ?
+            """,
+            (
+                decision_block_time, decision_wall_time,
+                depth_at_10s, depth_velocity_10s,
+                swap_count_10s, buy_sell_ratio_10s,
+                pre_dip_1m_usd_vol, pre_dip_1m_swap_count,
+                suppressions, would_alert,
+                row_id,
+            ),
         )
         await db.commit()
 

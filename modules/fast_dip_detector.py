@@ -55,9 +55,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
+import aiohttp
 import aiosqlite
 
 import database as db
+from utils.dexscreener import get_sol_price
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +92,14 @@ BACKFILL_SOFT_TIMEOUT_SEC = 30
 
 # Status set the detector watches (Stage 1: same as Pass 1's cohort).
 WATCHED_STATUSES = ("tracking", "ath_confirmed", "alerted")
+
+# Stage 2: +10s decision gate.
+DECISION_DELAY_SEC          = 10
+SUPPRESS_BS_RATIO_MAX       = 0.25   # buy share < 0.25 → suppress
+SUPPRESS_DEPTH_VELOCITY_MIN = 0.02   # depth still deepening → suppress
+SUPPRESS_PRE_DIP_VOL_MIN    = 5000.0 # pre-dip 1m USD vol < $5k → suppress
+SUPPRESS_SWAP_COUNT_MIN     = 5      # < 5 swaps in 10s window → suppress
+SUPPRESS_TRIGGER_LAG_MAX    = 5.0    # gRPC stream lag > 5s → suppress
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
@@ -130,8 +140,18 @@ def price_sol_from_event(quote_amount: int, base_amount: int | None) -> float | 
 class FastDipDetector:
     """Stage 1 live fast-dip detector. See module docstring."""
 
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        session: aiohttp.ClientSession | None = None,
+    ):
         self._db_path = db_path
+        # aiohttp session used by Stage 2 to fetch SOL/USD via
+        # utils.dexscreener.get_sol_price. Optional so tests can
+        # construct the detector without a live HTTP session — when
+        # None, pre_dip_1m_usd_vol stays NULL and the pre_dip_vol
+        # suppression rule is skipped per Stage 2's NULL handling.
+        self._session = session
 
         # Per-token state (keyed on token_address):
         self._buffers: dict[str, deque[_SwapEvent]] = {}
@@ -147,6 +167,10 @@ class FastDipDetector:
         # overwrite each other in shared state — each dip episode is
         # bound to its own task object.
         self._pending_inserts: dict[str, asyncio.Task] = {}
+        # Stage 2: live +10s decision tasks. We hold strong references
+        # so unreferenced tasks aren't GC'd mid-flight; the done-callback
+        # discards each task on completion.
+        self._decision_tasks: set[asyncio.Task] = set()
         # Wall-clock last-touch for LRU eviction. Updated on every
         # accepted on_event for that token.
         self._last_touch: dict[str, float] = {}
@@ -530,6 +554,10 @@ class FastDipDetector:
 
         symbol = self._symbol_cache.get(token_address)
         wall_now = time.time()
+        # Trigger-time lag captures gRPC stream lag (wall-clock now vs.
+        # the chain block_time the trigger event was stamped at). Set
+        # at INSERT and never modified by the +10s decision UPDATE.
+        trigger_lag_seconds = wall_now - trigger_block_time
 
         logger.info(
             f"📉 fast_dip TRIGGER ${symbol or token_address[:8]} "
@@ -554,6 +582,8 @@ class FastDipDetector:
                     rolling_max_price_sol=rolling_max,
                     rolling_max_block_time=rolling_max_bt,
                     drop_pct=drop_pct,
+                    swap_density_5s=swap_density_5s,
+                    trigger_lag_seconds=trigger_lag_seconds,
                     db_path=self._db_path,
                 )
             except Exception as e:
@@ -562,8 +592,33 @@ class FastDipDetector:
                 )
                 return None
 
-        task = self._loop.create_task(_do_insert())
-        self._pending_inserts[token_address] = task
+        insert_task = self._loop.create_task(_do_insert())
+        self._pending_inserts[token_address] = insert_task
+
+        # Stage 2: schedule the +10s decision task. It awaits the INSERT
+        # task to get the row id, then sleeps until trigger_wall_time +
+        # DECISION_DELAY_SEC, then queries pumpswap_fees and UPDATEs the
+        # row. Known gaps (per Stage 2 spec, deferred to Stage 3):
+        #   - Bot restart during the 10s window leaves decision-side
+        #     columns NULL forever (no restart-recovery sweeper yet).
+        #   - gRPC stream lag during the 10s window can cause late-
+        #     arriving events to miss the decision-time DB query. The
+        #     trigger_lag suppression rule provides partial protection.
+        #   - Rapid repeat triggers on the same token spawn parallel
+        #     decision tasks; each is keyed by its own row id and
+        #     UPDATEs independently, no coordination needed.
+        decision_task = self._loop.create_task(self._run_decision(
+            insert_task=insert_task,
+            pool_address=pool_address,
+            trigger_block_time=trigger_block_time,
+            trigger_wall_time=wall_now,
+            rolling_max_price_sol=rolling_max,
+            drop_pct_at_trigger=drop_pct,
+            trigger_lag_seconds=trigger_lag_seconds,
+            symbol=symbol,
+        ))
+        self._decision_tasks.add(decision_task)
+        decision_task.add_done_callback(self._decision_tasks.discard)
 
     def _maybe_end_dip(
         self,
@@ -664,6 +719,209 @@ class FastDipDetector:
                 )
 
         self._loop.create_task(_do_update())
+
+    # ── Stage 2: +10s decision gate ──────────────────────────────────────
+
+    async def _run_decision(
+        self,
+        *,
+        insert_task: asyncio.Task,
+        pool_address: str | None,
+        trigger_block_time: float,
+        trigger_wall_time: float,
+        rolling_max_price_sol: float,
+        drop_pct_at_trigger: float,
+        trigger_lag_seconds: float,
+        symbol: str | None,
+    ) -> None:
+        """Sleep until trigger_wall_time + 10s, then query pumpswap_fees
+        for the post-trigger 10s window and pre-dip 1m window, compute
+        the decision-side features, evaluate the OR-composed suppression
+        rules, and UPDATE the shadow row.
+
+        Shadow-only — no Telegram, no alert dispatch, no token state
+        changes. Pure data capture for offline analysis.
+        """
+        try:
+            row_id = await insert_task
+        except Exception as e:
+            logger.error(
+                f"📉 fast_dip: decision task failed waiting for INSERT: {e}"
+            )
+            return
+        if row_id is None:
+            return
+
+        # Sleep until +10s after trigger_wall_time. If we're already
+        # late (e.g. heavy GC, blocked loop), proceed immediately —
+        # the decision row will still get populated, and offline
+        # analysis can filter on (decision_wall_time - trigger_wall_time).
+        target_wall = trigger_wall_time + DECISION_DELAY_SEC
+        remaining = target_wall - time.time()
+        if remaining > 0:
+            try:
+                await asyncio.sleep(remaining)
+            except asyncio.CancelledError:
+                raise
+
+        decision_wall_time = time.time()
+        decision_block_time = trigger_block_time + DECISION_DELAY_SEC
+
+        # Query both windows. pool_address may be NULL on poorly-
+        # formed trigger inputs; in that case both queries return
+        # zero rows (the swap_count rule will fire and suppress
+        # the alert correctly).
+        try:
+            async with db.db_connect(self._db_path) as conn:
+                async with conn.execute(
+                    """
+                    SELECT event_type, block_time, quote_amount, base_amount
+                    FROM pumpswap_fees
+                    WHERE pool_address = ?
+                      AND block_time >= ?
+                      AND block_time <= ?
+                    ORDER BY block_time ASC
+                    """,
+                    (pool_address, trigger_block_time,
+                     trigger_block_time + DECISION_DELAY_SEC),
+                ) as cur:
+                    swaps_10s = await cur.fetchall()
+                async with conn.execute(
+                    """
+                    SELECT quote_amount
+                    FROM pumpswap_fees
+                    WHERE pool_address = ?
+                      AND block_time >= ?
+                      AND block_time < ?
+                    """,
+                    (pool_address, trigger_block_time - 60.0,
+                     trigger_block_time),
+                ) as cur:
+                    pre_dip_rows = await cur.fetchall()
+        except Exception as e:
+            logger.error(
+                f"📉 fast_dip: decision-time DB query failed for row "
+                f"{row_id}: {e}"
+            )
+            return
+
+        # ── Feature computation ─────────────────────────────────────
+        swap_count_10s = len(swaps_10s)
+        pre_dip_1m_swap_count = len(pre_dip_rows)
+
+        # depth_at_10s — frozen trigger-time peak. Latest valid swap
+        # in window (per-tick price = price_sol_from_event(qa, ba)).
+        depth_at_10s: float | None = None
+        depth_velocity_10s: float | None = None
+        if swaps_10s and rolling_max_price_sol > 0:
+            for ev_type, bt, qa, ba in reversed(swaps_10s):
+                price = price_sol_from_event(qa, ba)
+                if price is not None:
+                    depth_at_10s = 1.0 - (price / rolling_max_price_sol)
+                    depth_velocity_10s = (
+                        depth_at_10s - drop_pct_at_trigger
+                    ) / DECISION_DELAY_SEC
+                    break
+
+        # buy_sell_ratio_10s — VOLUME-BASED buy share. quote_amount is
+        # in lamports; the ratio is dimensionless so the unit cancels.
+        buy_quote = 0
+        sell_quote = 0
+        for ev_type, bt, qa, ba in swaps_10s:
+            if qa is None:
+                continue
+            if ev_type == "buy":
+                buy_quote += qa
+            elif ev_type == "sell":
+                sell_quote += qa
+        total_quote = buy_quote + sell_quote
+        buy_sell_ratio_10s: float | None = None
+        if total_quote > 0:
+            buy_sell_ratio_10s = buy_quote / total_quote
+
+        # pre_dip_1m_usd_vol — total quote-side volume across the 60s
+        # before trigger, converted SOL→USD. quote_amount is lamports
+        # (1e9 / SOL).
+        # Note: utils.dexscreener.get_sol_price seeds with a hardcoded
+        # 150.0 before its first successful fetch and returns last-good
+        # on outage. First ~60s after process restart compute USD vol
+        # against the seed, which can under-estimate by ~25% if SOL has
+        # drifted from 150. In shadow mode this surfaces as elevated
+        # pre_dip_vol suppressions in the first minute after startup —
+        # filter by time-since-process-start in offline analysis.
+        # Revisit before Stage 3 (real alerting).
+        pre_dip_1m_usd_vol: float | None = None
+        if self._session is not None and pre_dip_rows:
+            pre_dip_lamports = sum(qa or 0 for (qa,) in pre_dip_rows)
+            pre_dip_sol = pre_dip_lamports / 1_000_000_000.0
+            try:
+                sol_usd = await get_sol_price(self._session)
+                if sol_usd > 0:
+                    pre_dip_1m_usd_vol = pre_dip_sol * sol_usd
+            except Exception as e:
+                logger.warning(
+                    f"📉 fast_dip: SOL/USD fetch failed for row "
+                    f"{row_id}: {e}"
+                )
+        elif self._session is not None and not pre_dip_rows:
+            # Zero events in the pre-dip window: USD vol is exactly 0.
+            # Distinguishable from "couldn't compute" because we still
+            # had a session — store 0.0 so the < $5k rule fires.
+            pre_dip_1m_usd_vol = 0.0
+
+        # ── Suppression rules (OR-composed, deterministic order) ───
+        # When a feature is NULL, its rule is SKIPPED rather than
+        # treated as failing. trigger_lag is in-process (already in
+        # scope), so no NULL handling needed there.
+        fired: list[str] = []
+        if (buy_sell_ratio_10s is not None
+                and buy_sell_ratio_10s < SUPPRESS_BS_RATIO_MAX):
+            fired.append("bs_ratio")
+        if (depth_velocity_10s is not None
+                and depth_velocity_10s >= SUPPRESS_DEPTH_VELOCITY_MIN):
+            fired.append("depth_velocity")
+        if (pre_dip_1m_usd_vol is not None
+                and pre_dip_1m_usd_vol < SUPPRESS_PRE_DIP_VOL_MIN):
+            fired.append("pre_dip_vol")
+        if swap_count_10s < SUPPRESS_SWAP_COUNT_MIN:
+            fired.append("swap_count")
+        if trigger_lag_seconds > SUPPRESS_TRIGGER_LAG_MAX:
+            fired.append("trigger_lag")
+
+        if fired:
+            would_alert = 0
+            suppressions: str | None = ",".join(fired)
+        else:
+            would_alert = 1
+            suppressions = None
+
+        try:
+            await db.update_fast_dip_decision(
+                row_id=row_id,
+                decision_block_time=decision_block_time,
+                decision_wall_time=decision_wall_time,
+                depth_at_10s=depth_at_10s,
+                depth_velocity_10s=depth_velocity_10s,
+                swap_count_10s=swap_count_10s,
+                buy_sell_ratio_10s=buy_sell_ratio_10s,
+                pre_dip_1m_usd_vol=pre_dip_1m_usd_vol,
+                pre_dip_1m_swap_count=pre_dip_1m_swap_count,
+                suppressions=suppressions,
+                would_alert=would_alert,
+                db_path=self._db_path,
+            )
+        except Exception as e:
+            logger.error(
+                f"📉 fast_dip: decision UPDATE failed for row {row_id}: {e}"
+            )
+            return
+
+        logger.info(
+            f"📉 fast_dip DECISION ${symbol or 'unknown'} row={row_id} "
+            f"would_alert={would_alert} "
+            f"suppressions={suppressions or '-'} "
+            f"swap_count_10s={swap_count_10s}"
+        )
 
     # ── Eviction ─────────────────────────────────────────────────────────
 

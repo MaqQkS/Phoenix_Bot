@@ -967,7 +967,7 @@ async def save_pumpswap_fees_batch(
 
 
 async def prune_old_pumpswap_fees(
-    retention_hours: int = 168,  # 7 days
+    retention_hours: int = 48,  # 2 days — older lives in cold storage backups
     db_path: str = DB_PATH,
 ) -> int:
     """Delete pumpswap_fees rows older than retention_hours.

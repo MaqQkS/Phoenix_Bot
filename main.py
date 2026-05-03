@@ -347,14 +347,15 @@ from modules.grpc_indexer import run_grpc_indexer
 
 
 async def pumpswap_fees_prune_loop(db_path: str):
-    """Prune pumpswap_fees rows older than 7 days. Runs hourly.
+    """Prune pumpswap_fees rows older than 48h. Runs hourly.
 
     Added after the 2026-05-02 incident where pumpswap_fees grew
     unbounded (millions of rows from grpc_indexer at ~14 evt/s) and
-    caused chronic lock contention. 7-day retention is the SCAM rework
-    working window; older fee history lives in cold storage."""
+    caused chronic lock contention. Live modules don't read fee history
+    beyond alert-time windows; older data lives in cold-storage
+    backup_2026_05_02."""
     PRUNE_INTERVAL_SECONDS = 3600
-    RETENTION_HOURS = 168  # 7 days
+    RETENTION_HOURS = 48  # 2 days — older lives in cold storage backups
 
     # Initial delay so we don't slam the DB at startup
     await asyncio.sleep(300)  # 5 min

@@ -146,8 +146,9 @@ class PriceTracker:
             # ── Update ATH if new high from live price ─────────────────
             # When running-max exceeds a Birdeye-derived ATH, flip source to
             # 'birdeye_running_max' so downstream can tell live-poll peaks
-            # apart from Birdeye-sourced peaks. Non-Birdeye sources
-            # ('fallback', 'running_max', 'unseeded') are left untouched.
+            # apart from Birdeye-sourced peaks. 'unseeded' rows get
+            # promoted to 'running_max' since there's no Birdeye baseline
+            # to qualify with. 'fallback' and 'running_max' are untouched.
             if price > token.ath_price:
                 old_ath_mcap = token.ath_mcap
                 token.ath_price = price
@@ -155,6 +156,8 @@ class PriceTracker:
                 token.ath_time  = time.time()
                 if token.ath_source in ("birdeye", "birdeye_reseeded", "birdeye_corrected"):
                     token.ath_source = "birdeye_running_max"
+                elif token.ath_source == "unseeded":
+                    token.ath_source = "running_max"
                 if token.status in (TokenStatus.ATH_CONFIRMED, TokenStatus.ALERTED):
                     logger.info(
                         f"📈 ${token.symbol} new ATH: ${mcap:,.0f} mcap "

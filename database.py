@@ -6,6 +6,7 @@ Also stores fee_gate_log, lp_floor_log, stillborn_log for shadow-mode filters.
 """
 
 import aiosqlite
+import asyncio
 import json
 import logging
 import os
@@ -980,20 +981,42 @@ async def save_pumpswap_fees_batch(
 
 
 async def prune_old_pumpswap_fees(
-    retention_hours: int = 48,  # 2 days — older lives in cold storage backups
+    retention_hours: int = 48,
     db_path: str = DB_PATH,
+    chunk_size: int = 10000,
 ) -> int:
-    """Delete pumpswap_fees rows older than retention_hours.
-    Returns the number of rows deleted. Safe to call while bot is
-    running — uses block_time which is indexed via received_at fallback."""
+    """Delete pumpswap_fees rows older than retention_hours, in
+    chunks to avoid long exclusive locks that starve concurrent
+    writers. Returns total rows deleted."""
     cutoff = time.time() - (retention_hours * 3600)
-    async with db_connect(db_path) as db:
-        cursor = await db.execute(
-            "DELETE FROM pumpswap_fees WHERE received_at < ?",
-            (cutoff,),
+    total_deleted = 0
+    MAX_CHUNKS = 200  # 2M-row ceiling per prune cycle
+    for _ in range(MAX_CHUNKS):
+        async with db_connect(db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM pumpswap_fees "
+                "WHERE id IN ("
+                "  SELECT id FROM pumpswap_fees "
+                "  WHERE received_at < ? LIMIT ?"
+                ")",
+                (cutoff, chunk_size),
+            )
+            await db.commit()
+            deleted = cursor.rowcount or 0
+        total_deleted += deleted
+        logger.debug(
+            f"prune chunk: deleted={deleted} "
+            f"cumulative={total_deleted}"
         )
-        await db.commit()
-        return cursor.rowcount or 0
+        if deleted < chunk_size:
+            break
+        await asyncio.sleep(0.1)  # yield to concurrent writers
+    else:
+        logger.warning(
+            f"prune hit MAX_CHUNKS={MAX_CHUNKS}; "
+            f"partial: {total_deleted}"
+        )
+    return total_deleted
 
 
 # ── Fee Gate shadow log ──────────────────────────────────────────────────────

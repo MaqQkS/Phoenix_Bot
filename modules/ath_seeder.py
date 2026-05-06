@@ -219,6 +219,62 @@ async def seed_ath_for_token(
         logger.error(f"ATH seed error for ${token.symbol}: {e}")
 
 
+async def refresh_ath_at_alert(
+    token: TrackedToken,
+    http_session: aiohttp.ClientSession,
+    config: dict,
+) -> bool:
+    """Alert-time Birdeye ATH refresh. Closes the Dex-poll cadence gap.
+
+    Fetches Birdeye OHLCV from migration_time to now, takes the max.
+    If max > token.ath_price, mutates the token in-memory AND persists.
+    Returns True if ATH was raised, False if no change or on error.
+
+    Fail-open: any exception is logged and returns False so the alert
+    still fires with whatever ATH was previously known.
+    """
+    await _rate_limit()
+    try:
+        new_birdeye_ath = await get_ath_since_migration(
+            token_address=token.address,
+            migration_time=token.migration_time,
+            api_key=config["birdeye"]["api_key"],
+            session=http_session,
+        )
+    except Exception as e:
+        logger.warning(
+            f"Alert-time ATH refresh Birdeye error for ${token.symbol}: {e!r}"
+        )
+        return False
+
+    if not new_birdeye_ath or new_birdeye_ath <= token.ath_price:
+        return False
+
+    previous_price = token.ath_price
+    previous_mcap = token.ath_mcap
+    token.ath_price = new_birdeye_ath
+    token.ath_mcap = (
+        token.current_mcap * (new_birdeye_ath / token.current_price)
+        if token.current_price > 0
+        else 0.0
+    )
+    token.ath_time = time.time()
+    token.ath_source = "birdeye_alert_refresh"
+    await db.save_token(token)
+    gap_pct = (
+        (new_birdeye_ath / previous_price - 1) * 100
+        if previous_price > 0
+        else 0.0
+    )
+    logger.info(
+        f"ALERT_REFRESH_HIT: ${token.symbol} "
+        f"ath_price {previous_price:.10f} -> {new_birdeye_ath:.10f} "
+        f"(mcap ${previous_mcap:,.0f} -> ${token.ath_mcap:,.0f}, "
+        f"gap_pct={gap_pct:.1f}%)"
+    )
+    return True
+
+
 async def process_retry_queue(
     http_session: aiohttp.ClientSession,
     config: dict,

@@ -28,6 +28,7 @@ from modules.price_tracker      import PriceTracker
 from modules.alert_trigger      import AlertTrigger
 from modules.telegram_sender    import TelegramSender
 from modules                    import alert_gate
+from modules                    import ath_seeder
 from modules.fast_dip_detector  import FastDipDetector
 from snapshot_holders            import snapshot_top_holders
 from holder_filter               import evaluate_holder_filter, log_holder_filter, get_recent_filter_result, mark_actually_blocked
@@ -182,6 +183,31 @@ async def price_alert_loop(
                         if hf_log_row_id is not None:
                             await mark_actually_blocked(hf_log_row_id)
                         continue
+
+                    # ── Birdeye-at-alert-time refresh — closes Dex poll cadence gap ──
+                    try:
+                        refreshed = await ath_seeder.refresh_ath_at_alert(
+                            token, session, config
+                        )
+                        if refreshed:
+                            # Tier was picked against pre-refresh ATH. Log if recompute
+                            # would have shifted the tier (Path 1 — keep original tier;
+                            # observation only).
+                            new_drawdown = token.drop_from_ath
+                            recomputed = trigger.check_tokens([token])
+                            if recomputed:
+                                _, recomputed_tier = recomputed[0]
+                                if recomputed_tier["index"] != tier_index:
+                                    logger.info(
+                                        f"REFRESH_TIER_SHIFT: ${token.symbol} tier "
+                                        f"{tier_index} -> would have been "
+                                        f"{recomputed_tier['index']} (drawdown now "
+                                        f"{new_drawdown*100:.1f}%)"
+                                    )
+                    except Exception as e:
+                        logger.warning(
+                            f"Alert-time ATH refresh error for ${token.symbol}: {e}"
+                        )
 
                     sent = await sender.send_dip_alert(
                         token, tier, session,

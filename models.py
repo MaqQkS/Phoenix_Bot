@@ -37,13 +37,15 @@ class TrackedToken:
     ath_mcap: float = 0.0
     ath_time: float = 0.0
     # Provenance of ath_price. Values:
-    #   'unseeded'            — no Birdeye data yet
-    #   'birdeye'             — initial Birdeye seed accepted
-    #   'birdeye_reseeded'    — re-query found higher peak than initial seed
-    #   'birdeye_corrected'   — T+15m correction found higher peak
-    #   'birdeye_running_max' — running-max exceeded any Birdeye value
-    #   'running_max'         — Birdeye never succeeded, timeout
-    #   'fallback'            — legacy historical rows
+    #   'unseeded'             — no Birdeye data yet
+    #   'birdeye'              — initial Birdeye seed accepted
+    #   'birdeye_reseeded'     — re-query found higher peak than initial seed
+    #   'birdeye_corrected'    — T+15m correction found higher peak
+    #   'birdeye_alert_refresh'— alert-time Birdeye refresh raised ath_price
+    #                            above what the live Dex poll captured
+    #   'birdeye_running_max'  — running-max exceeded any Birdeye value
+    #   'running_max'          — Birdeye never succeeded, timeout
+    #   'fallback'             — legacy historical rows
     ath_source: str = "unseeded"
 
     # ── Volume ────────────────────────────────────────────────────────────

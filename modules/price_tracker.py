@@ -13,7 +13,7 @@ import time
 import database as db
 from models import TrackedToken, TokenStatus
 from utils.dexscreener import get_pumpswap_pairs_bulk, get_pumpswap_pair, extract_price_data
-from modules import ath_refresh_shadow
+from modules import ath_refresh_shadow, ath_seeder
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,19 @@ class PriceTracker:
                 if token.ath_source in ("birdeye", "birdeye_reseeded", "birdeye_corrected"):
                     token.ath_source = "birdeye_running_max"
                 elif token.ath_source == "unseeded":
-                    token.ath_source = "running_max"
+                    age_seconds = (
+                        time.time() - token.migration_time
+                        if token.migration_time > 0
+                        else float("inf")
+                    )
+                    if age_seconds < 1800:
+                        ath_seeder.enqueue_retry(token)
+                        logger.info(
+                            f"Deferring 'running_max' promotion for {token.symbol} "
+                            f"(age {age_seconds:.0f}s) — enqueued Birdeye retry"
+                        )
+                    else:
+                        token.ath_source = "running_max"
                 if token.status in (TokenStatus.ATH_CONFIRMED, TokenStatus.ALERTED):
                     logger.info(
                         f"📈 ${token.symbol} new ATH: ${mcap:,.0f} mcap "

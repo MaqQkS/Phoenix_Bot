@@ -15,7 +15,7 @@ from typing import Optional
 import database as db
 from models import TrackedToken, TokenStatus
 from utils.dexscreener import get_sol_price, extract_price_data
-from modules import ath_refresh_shadow
+from modules import ath_refresh_shadow, ath_seeder
 from modules.migration_ws import fetch_pool_metadata, _register_grpc_pool_meta
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ async def backfill_recent_migrations(
                 current_price=price,
                 current_mcap=mcap,
                 liquidity_usd=data.get("liquidity_usd", 0),
-                ath_price=0.0,  # will be seeded by price_tracker
+                ath_price=0.0,
                 migration_time=created_at,
                 volume_1h=data.get("volume_1h", 0),
                 volume_6h=data.get("volume_6h", 0),
@@ -113,6 +113,7 @@ async def backfill_recent_migrations(
                 )
 
             await db.save_token(token)
+            await ath_seeder.seed_ath_for_token(token, session, config)
             _register_grpc_pool_meta(token)
             ath_refresh_shadow.observe_token_created(token)
             ath_refresh_shadow.log_status_transition(
@@ -315,6 +316,7 @@ async def periodic_backfill_loop(
                         )
 
                     await db.save_token(token)
+                    await ath_seeder.seed_ath_for_token(token, session, config)
                     _register_grpc_pool_meta(token)
                     ath_refresh_shadow.observe_token_created(token)
                     ath_refresh_shadow.log_status_transition(

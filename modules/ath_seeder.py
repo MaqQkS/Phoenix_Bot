@@ -211,7 +211,6 @@ async def process_retry_queue(
     sustained_interval = retry_cfg.get("sustained_interval_seconds", 120)
     max_age            = retry_cfg.get("max_age_seconds", 1800)
     reseed_window      = retry_cfg.get("reseed_window_seconds", 600)
-    correction_delay   = retry_cfg.get("correction_delay_seconds", 900)
 
     for address, entry in list(_ath_retry_queue.items()):
         # Backwards-compat: legacy entries were raw timestamps (float),
@@ -382,13 +381,34 @@ async def process_retry_queue(
     for address in to_remove:
         _ath_retry_queue.pop(address, None)
 
-    # ── One-shot T+15m correction pass ────────────────────────────────
-    # For tokens that have already exited the retry queue: if a 15m
-    # candle closed shortly after the reseed window expired and reveals
-    # a higher peak than what the 1m-candle loop captured, correct it.
-    # Uses a 60s window (correction_delay_seconds .. +60) so a token
-    # gets at most one correction attempt per poll interval.
+    return processed
+
+
+async def process_t15m_correction(
+    http_session: aiohttp.ClientSession,
+    config: dict,
+) -> int:
+    """One-shot T+15m correction pass for already-seeded tokens.
+
+    For tokens that have already exited the retry queue: if a 15m
+    candle closed shortly after the reseed window expired and reveals
+    a higher peak than what the 1m-candle loop captured, correct it.
+    Uses a 60s window (correction_delay_seconds .. +60) so a token
+    gets at most one correction attempt per poll interval.
+
+    Independent of the retry queue — operates on db.load_all_tokens()
+    and runs on every poll, even when the queue is empty.
+
+    Returns the number of corrections applied (for caller logging).
+    """
+    logger.debug("T+15m correction pass entering")
+    now = time.time()
+    corrections = 0
+
+    retry_cfg = config.get("ath_retry", {}) or {}
+    correction_delay = retry_cfg.get("correction_delay_seconds", 900)
     correction_window_end = correction_delay + 60
+
     try:
         all_tokens = await db.load_all_tokens()
     except Exception as e:
@@ -428,7 +448,8 @@ async def process_retry_queue(
                     f"${token.ath_mcap:,.0f} (was ${previous_mcap:,.0f})"
                 )
                 await _run_phantom_validation(token, http_session, config)
+                corrections += 1
         except Exception as e:
             logger.debug(f"T+15m correction error for {token.address[:8]}: {e}")
 
-    return processed
+    return corrections

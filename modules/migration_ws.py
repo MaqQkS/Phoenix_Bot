@@ -521,8 +521,13 @@ class MigrationWebSocket:
 
     async def process_ath_retry_queue(self):
         """Thin wrapper. Delegates to ath_seeder module.
-        Preserved for main.py compatibility."""
-        return await ath_seeder.process_retry_queue(
-            self._http_session,
-            self.config,
-        )
+        Preserved for main.py compatibility. Each pass is wrapped
+        independently so a failure in one does not suppress the other."""
+        try:
+            await ath_seeder.process_retry_queue(self._http_session, self.config)
+        except Exception as e:
+            logger.error(f"ATH retry queue error: {e}")
+        try:
+            await ath_seeder.process_t15m_correction(self._http_session, self.config)
+        except Exception as e:
+            logger.error(f"T+15m correction error: {e}")

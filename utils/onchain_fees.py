@@ -140,7 +140,7 @@ async def get_global_fees(
     
     Returns:
         Dict with total_fees_sol, total_lp_fee_sol, total_protocol_fee_sol,
-        tx_count, event_count, or None on failure.
+        total_creator_fee_sol, tx_count, event_count, or None on failure.
     """
     try:
         # Step 1: Get all transaction signatures for the pool
@@ -176,6 +176,7 @@ async def get_global_fees(
         # Step 2: Fetch transactions and parse events
         total_lp_fee = 0
         total_protocol_fee = 0
+        total_creator_fee = 0
         event_count = 0
         tx_count = 0
         errors = 0
@@ -202,18 +203,20 @@ async def get_global_fees(
                 for event in events:
                     total_lp_fee += event["lp_fee"]
                     total_protocol_fee += event["protocol_fee"]
+                    total_creator_fee += event.get("creator_fee", 0)
                     event_count += 1
             
             # Rate limit between batches
             await asyncio.sleep(0.2)
         
-        total_fees_lamports = total_lp_fee + total_protocol_fee
+        total_fees_lamports = total_lp_fee + total_protocol_fee + total_creator_fee
         total_fees_sol = total_fees_lamports / LAMPORTS_PER_SOL
         
         result = {
             "total_fees_sol": total_fees_sol,
             "total_lp_fee_sol": total_lp_fee / LAMPORTS_PER_SOL,
             "total_protocol_fee_sol": total_protocol_fee / LAMPORTS_PER_SOL,
+            "total_creator_fee_sol": total_creator_fee / LAMPORTS_PER_SOL,
             "tx_count": tx_count,
             "event_count": event_count,
             "sig_count": len(all_sigs),
@@ -222,7 +225,9 @@ async def get_global_fees(
         
         logger.info(
             f"Pool {pool_address[:8]} fees: {total_fees_sol:.2f} SOL "
-            f"(LP: {result['total_lp_fee_sol']:.2f}, Protocol: {result['total_protocol_fee_sol']:.2f}) "
+            f"(LP: {result['total_lp_fee_sol']:.2f}, "
+            f"Protocol: {result['total_protocol_fee_sol']:.2f}, "
+            f"Creator: {result['total_creator_fee_sol']:.2f}) "
             f"from {event_count} events in {tx_count} txs"
         )
         

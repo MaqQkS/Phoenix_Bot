@@ -199,10 +199,13 @@ def _volume_label(vol_1h: float, vol_6h: float) -> str:
     return "Quiet"
 
 
-def _lp_state(liquidity_usd: float) -> str:
-    if liquidity_usd < 8_000:
+def _lp_state(liquidity_usd: float, cfg: dict | None = None) -> str:
+    cfg = cfg or {}
+    min_lp = cfg.get("min_liquidity_usd", 8_000)
+    warn_lp = cfg.get("warn_liquidity_usd", 15_000)
+    if liquidity_usd < min_lp:
         return "Low"
-    if liquidity_usd < 15_000:
+    if liquidity_usd < warn_lp:
         return "Thin"
     if liquidity_usd < 40_000:
         return "Tradable"
@@ -303,20 +306,24 @@ class TelegramSender:
         session: aiohttp.ClientSession,
         ghost_filter_result: dict | None = None,
         fee_eval: FeeEvaluation | None = None,
-    ):
-        """Format and send a dip alert for a token. fee_eval may be pre-computed by the gate."""
+    ) -> bool:
+        """Format and send a dip alert. Returns True only when Telegram accepts it."""
         msg = await self._format_alert(
             token, tier,
             ghost_filter_result=ghost_filter_result,
             fee_eval=fee_eval,
         )
-        await self._send(msg, session)
+        return await self._send(msg, session)
 
     def _fetch_fee_stats(self, address: str, migration_time: float | None) -> dict | None:
         """Pull lifetime AMM + bribe aggregates for a token from pumpswap_fees."""
         import sqlite3
         try:
-            conn = sqlite3.connect(database.DB_PATH)
+            conn = sqlite3.connect(
+                f"file:{database.DB_PATH}?mode=ro",
+                uri=True,
+                timeout=2.0,
+            )
             cur = conn.cursor()
             cur.execute("""
                 SELECT
@@ -584,7 +591,7 @@ class TelegramSender:
         tier_name = tier.get("name", "Dip")
 
         vol_label = _volume_label(token.volume_1h, token.volume_6h)
-        lp_state = _lp_state(token.liquidity_usd)
+        lp_state = _lp_state(token.liquidity_usd, self.lp_floor_cfg)
         # Compute fee evaluation if caller didn't pre-compute (single source of truth).
         # When called from the alert gate (Step 4+), fee_eval is passed in and we
         # neither re-fetch nor re-log.
@@ -793,33 +800,37 @@ class TelegramSender:
         # Ghost Filter (Tier 1 only, shadow mode)
         if ghost_filter_result is not None:
             gf = ghost_filter_result
-            uwc = gf["user_wallet_count"]
-            low_pct = (gf["low_sol_count"] / uwc * 100) if uwc > 0 else 0
+            uwc = int(gf.get("user_wallet_count") or 0)
+            low_sol_count = int(gf.get("low_sol_count") or 0)
+            funding_collision_count = int(gf.get("funding_collision_count") or 0)
+            collision_clusters = gf.get("collision_clusters") or []
+            block_reason = gf.get("block_reason") or ""
+            low_pct = (low_sol_count / uwc * 100) if uwc > 0 else 0
             # Cached payloads from before the 3-mode rollout lack `verdict`;
             # derive a binary-equivalent value from would_block so they still
             # render correctly during the 1-hour cache TTL after deploy.
             verdict = gf.get("verdict") or ("block" if gf.get("would_block") else "pass")
 
             if verdict == "block":
-                if gf["block_reason"] == "both":
+                if block_reason == "both":
                     gf_read = "bundle suspected + low-sol cluster"
-                elif gf["block_reason"] == "funding_collisions":
+                elif block_reason == "funding_collisions":
                     gf_read = "bundle suspected"
                 else:
                     gf_read = "low-sol cluster"
 
-                col_line = f"• Collisions: {gf['funding_collision_count']} wallets"
-                if gf["collision_clusters"]:
-                    col_line += f" in {len(gf['collision_clusters'])} clusters"
+                col_line = f"• Collisions: {funding_collision_count} wallets"
+                if collision_clusters:
+                    col_line += f" in {len(collision_clusters)} clusters"
 
                 lines.extend(["", "🕵️ <b>Ghost Filter: 🔴 WOULD BLOCK</b>", col_line])
-                for cl in gf["collision_clusters"][:4]:
-                    lines.append(f"  └ {cl['sol']:.4f} SOL × {cl['wallets']}")
-                lines.append(f"• Low SOL (&lt;0.1): {gf['low_sol_count']}/{uwc} ({low_pct:.0f}%)")
+                for cl in collision_clusters[:4]:
+                    lines.append(f"  └ {float(cl.get('sol') or 0):.4f} SOL × {cl.get('wallets') or 0}")
+                lines.append(f"• Low SOL (&lt;0.1): {low_sol_count}/{uwc} ({low_pct:.0f}%)")
                 lines.append(f"• Read: {gf_read}")
             elif verdict == "caution":
-                fund = gf["funding_collision_count"]
-                clust = len(gf["collision_clusters"])
+                fund = funding_collision_count
+                clust = len(collision_clusters)
                 fund_caution = fund >= GHOST_CAUTION_WALLETS
                 clust_caution = clust >= GHOST_CAUTION_CLUSTERS
                 if fund_caution and clust_caution:
@@ -830,20 +841,20 @@ class TelegramSender:
                     gf_read = "elevated cluster count"
 
                 col_line = f"• Collisions: {fund} wallets"
-                if gf["collision_clusters"]:
+                if collision_clusters:
                     col_line += f" in {clust} clusters"
 
                 lines.extend(["", "🕵️ <b>Ghost Filter: ⚠️ CAUTION</b>", col_line])
-                for cl in gf["collision_clusters"][:4]:
-                    lines.append(f"  └ {cl['sol']:.4f} SOL × {cl['wallets']}")
-                lines.append(f"• Low SOL (&lt;0.1): {gf['low_sol_count']}/{uwc} ({low_pct:.0f}%)")
+                for cl in collision_clusters[:4]:
+                    lines.append(f"  └ {float(cl.get('sol') or 0):.4f} SOL × {cl.get('wallets') or 0}")
+                lines.append(f"• Low SOL (&lt;0.1): {low_sol_count}/{uwc} ({low_pct:.0f}%)")
                 lines.append(f"• Read: {gf_read}")
             else:
                 lines.extend([
                     "",
                     "🕵️ <b>Ghost Filter: 🟢 PASS</b>",
-                    f"• Collisions: {gf['funding_collision_count']} wallets",
-                    f"• Low SOL (&lt;0.1): {gf['low_sol_count']}/{uwc} ({low_pct:.0f}%)",
+                    f"• Collisions: {funding_collision_count} wallets",
+                    f"• Low SOL (&lt;0.1): {low_sol_count}/{uwc} ({low_pct:.0f}%)",
                 ])
 
         # Builder Read
@@ -1092,7 +1103,7 @@ class TelegramSender:
             logger.debug(f"Command poll error: {e}")
             return []
 
-    async def _send(self, text: str, session: aiohttp.ClientSession, parse_mode: str | None = "HTML"):
+    async def _send(self, text: str, session: aiohttp.ClientSession, parse_mode: str | None = "HTML") -> bool:
         url = f"{TELEGRAM_API.format(token=self.bot_token)}/sendMessage"
         payload = {
             "chat_id": self.chat_id,
@@ -1116,7 +1127,7 @@ class TelegramSender:
                     status = resp.status
                     if 200 <= status < 300:
                         logger.info("✅ Telegram alert sent")
-                        return
+                        return True
                     if status == 429:
                         # Prefer Telegram's suggested retry_after if present.
                         wait = 2
@@ -1127,7 +1138,7 @@ class TelegramSender:
                             pass
                         if attempt >= max_attempts:
                             logger.error(f"Giving up after {max_attempts} Telegram retries")
-                            return
+                            return False
                         logger.warning(
                             f"Telegram 429 rate limit — waiting {wait}s "
                             f"(attempt {attempt}/{max_attempts})"
@@ -1141,7 +1152,7 @@ class TelegramSender:
                                 f"Giving up after {max_attempts} Telegram retries "
                                 f"(last status {status}: {body})"
                             )
-                            return
+                            return False
                         wait = backoff[attempt - 1]
                         logger.warning(
                             f"Telegram {status} — retrying in {wait}s "
@@ -1152,11 +1163,11 @@ class TelegramSender:
                     # Any other 4xx — permanent, do not retry.
                     body = await resp.text()
                     logger.error(f"Permanent Telegram error (4xx) {status}: {body}")
-                    return
+                    return False
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt >= max_attempts:
                     logger.error(f"Giving up after {max_attempts} Telegram retries: {e}")
-                    return
+                    return False
                 wait = backoff[attempt - 1]
                 logger.warning(
                     f"Telegram network error — retrying in {wait}s "
@@ -1164,6 +1175,7 @@ class TelegramSender:
                 )
                 await asyncio.sleep(wait)
                 continue
+        return False
 
     async def send_startup_message(self, session: aiohttp.ClientSession):
         """Send a simple startup ping so you know the bot is alive."""

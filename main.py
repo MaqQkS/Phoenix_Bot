@@ -183,11 +183,17 @@ async def price_alert_loop(
                             await mark_actually_blocked(hf_log_row_id)
                         continue
 
-                    await sender.send_dip_alert(
+                    sent = await sender.send_dip_alert(
                         token, tier, session,
                         ghost_filter_result=ghost_filter_result,
                         fee_eval=gate_result.fee_eval,
                     )
+                    if not sent:
+                        logger.error(
+                            f"Alert send failed; not marking alerted: "
+                            f"${token.symbol} ({token.address}) tier={tier_index}"
+                        )
+                        continue
                     await trigger.mark_alerted(token, tier_index, alert_time=ping_ts)
 
             # Process retry queues on the Dex cadence only — both call

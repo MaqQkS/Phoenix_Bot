@@ -12,7 +12,7 @@ Requirements before alerting:
   - Drop must be within the tier range
   - That tier must not have already been alerted
     (re-alerts on next tier if it drops further)
-  - Price must have been updated within the last 300 seconds (see MAX_PRICE_AGE_SECONDS constant)
+  - Price must have been updated recently (config.tracking.max_price_age_seconds)
 """
 
 import logging
@@ -23,12 +23,17 @@ from modules import ath_refresh_shadow
 
 logger = logging.getLogger(__name__)
 
-# Don't fire alerts if the price data is older than this
-MAX_PRICE_AGE_SECONDS = 300
+# Default freshness ceiling when config does not provide one.
+DEFAULT_MAX_PRICE_AGE_SECONDS = 300
 
 
 class AlertTrigger:
     def __init__(self, config: dict):
+        tracking_cfg = config.get("tracking", {}) or {}
+        self.max_price_age_seconds = tracking_cfg.get(
+            "max_price_age_seconds",
+            DEFAULT_MAX_PRICE_AGE_SECONDS,
+        )
         raw_tiers = config.get("dip_tiers", [
             {"name": "Tier 1", "min_drop": 0.50, "max_drop": 0.60},
             {"name": "Tier 2", "min_drop": 0.62, "max_drop": 0.80},
@@ -59,8 +64,15 @@ class AlertTrigger:
             # ── Stale price guard ──────────────────────────────────────
             # Don't fire alerts if the last price update is too old.
             # This prevents firing on stale/cached data from Dexscreener.
+            if token.last_price_update <= 0:
+                logger.warning(
+                    f"⚠️ ${token.symbol} has no recorded price timestamp — "
+                    f"skipping alert check (unknown freshness)"
+                )
+                continue
+
             price_age = time.time() - token.last_price_update
-            if token.last_price_update > 0 and price_age > MAX_PRICE_AGE_SECONDS:
+            if price_age > self.max_price_age_seconds:
                 logger.warning(
                     f"⚠️ ${token.symbol} price is {price_age:.0f}s old — "
                     f"skipping alert check (stale data)"

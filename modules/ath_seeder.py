@@ -64,7 +64,45 @@ async def _rate_limit() -> None:
         _last_call_ts = time.time()
 
 
-def enqueue_retry(token: TrackedToken) -> bool:
+async def rehydrate_retry_queue(db_path: str, config: dict) -> None:
+    """Rebuild the in-memory retry queue from the persisted table on
+    startup, dropping entries that are past the max_age ceiling or that
+    the tokens table now reports as authoritatively seeded.
+
+    Called once from main() before the price loop starts. Without this,
+    every restart silently drops in-flight retries into running_max,
+    since Phoenix sees ~13 process boundaries per 9 days.
+    """
+    now = time.time()
+    retry_cfg  = (config or {}).get("ath_retry", {}) or {}
+    max_age    = retry_cfg.get("max_age_seconds", 1800)
+
+    rows = await db.load_ath_retry_queue(db_path)
+
+    kept = 0
+    pruned = 0
+    for address, entry in rows.items():
+        queued_at = entry.get("queued_at", now)
+
+        # Prune by age first (cheap), then by ath_source (per-row DB hit).
+        if (now - queued_at) > max_age:
+            await db.delete_ath_retry(address)
+            pruned += 1
+            continue
+
+        token = await db.get_token(address)
+        if token is None or token.ath_source in ("birdeye", "birdeye_corrected"):
+            await db.delete_ath_retry(address)
+            pruned += 1
+            continue
+
+        _ath_retry_queue[address] = entry
+        kept += 1
+
+    logger.info(f"Rehydrated ATH retry queue: {kept} kept, {pruned} pruned")
+
+
+async def enqueue_retry(token: TrackedToken) -> bool:
     """Add token to the Birdeye retry queue. Idempotent on token.address.
 
     Returns True if newly added, False if already queued.
@@ -76,6 +114,7 @@ def enqueue_retry(token: TrackedToken) -> bool:
         "queued_at": now,
         "last_attempt": now,
     }
+    await db.upsert_ath_retry(token.address, now, now, None)
     return True
 
 
@@ -171,6 +210,7 @@ async def seed_ath_for_token(
                 "queued_at": now,
                 "last_attempt": now,
             }
+            await db.upsert_ath_retry(token.address, now, now, None)
             logger.info(
                 f"⏳ ${token.symbol} queued for ATH retry (Birdeye not ready yet)"
             )
@@ -213,16 +253,9 @@ async def process_retry_queue(
     reseed_window      = retry_cfg.get("reseed_window_seconds", 600)
 
     for address, entry in list(_ath_retry_queue.items()):
-        # Backwards-compat: legacy entries were raw timestamps (float),
-        # not dicts. Treat missing last_attempt as "retry eligible now".
-        if isinstance(entry, dict):
-            queued_at    = entry.get("queued_at", now)
-            last_attempt = entry.get("last_attempt", 0.0)
-            first_success_at = entry.get("first_success_at")
-        else:
-            queued_at    = float(entry)
-            last_attempt = 0.0
-            first_success_at = None
+        queued_at        = entry.get("queued_at", now)
+        last_attempt     = entry.get("last_attempt", 0.0)
+        first_success_at = entry.get("first_success_at")
         in_reseed_mode = first_success_at is not None
 
         token = await db.get_token(address)
@@ -316,11 +349,15 @@ async def process_retry_queue(
                         )
                         await _run_phantom_validation(token, http_session, config)
                     # Keep entry alive so reseed_window bounds the loop.
+                    new_first_success_at = first_success_at or now
                     _ath_retry_queue[address] = {
                         "queued_at": queued_at,
                         "last_attempt": now,
-                        "first_success_at": first_success_at or now,
+                        "first_success_at": new_first_success_at,
                     }
+                    await db.upsert_ath_retry(
+                        address, queued_at, now, new_first_success_at
+                    )
                 else:
                     # First-time success — never regress a running-max
                     # ath_price that may already be higher (especially
@@ -356,6 +393,9 @@ async def process_retry_queue(
                             "last_attempt": now,
                             "first_success_at": now,
                         }
+                        await db.upsert_ath_retry(
+                            address, queued_at, now, now
+                        )
                     else:
                         to_remove.append(address)
             else:
@@ -367,6 +407,7 @@ async def process_retry_queue(
                     "queued_at": queued_at,
                     "last_attempt": now,
                 }
+                await db.upsert_ath_retry(address, queued_at, now, None)
                 logger.info(f"No Birdeye ATH yet for ${token.symbol} — will retry")
 
             processed += 1
@@ -377,9 +418,11 @@ async def process_retry_queue(
                 "queued_at": queued_at,
                 "last_attempt": now,
             }
+            await db.upsert_ath_retry(address, queued_at, now, None)
 
     for address in to_remove:
         _ath_retry_queue.pop(address, None)
+        await db.delete_ath_retry(address)
 
     return processed
 

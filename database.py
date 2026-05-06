@@ -391,6 +391,21 @@ async def init_db(db_path: str = DB_PATH):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fds_token        ON fast_dip_shadow(token_address)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_fds_trigger_time ON fast_dip_shadow(trigger_block_time)")
 
+        # ── ATH retry queue persistence ──────────────────────────────────
+        # Mirrors the in-memory _ath_retry_queue in modules.ath_seeder so
+        # in-flight Birdeye retries survive restarts. first_success_at is
+        # nullable: NULL means "not yet seeded by Birdeye"; non-NULL marks
+        # reseed mode. Address is PK — INSERT OR REPLACE handles transitions
+        # from the 2-field shape to the 3-field shape on first success.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ath_retry_queue (
+                address          TEXT PRIMARY KEY,
+                queued_at        REAL NOT NULL,
+                last_attempt     REAL NOT NULL,
+                first_success_at REAL
+            )
+        """)
+
         # ── Migration: Stage 2 +10s decision gate columns ────────────────
         # swap_density_5s persisted at trigger time (was discarded in
         # Stage 1). pre_dip_1m_swap_count populated by the +10s decision
@@ -1363,3 +1378,60 @@ async def update_fast_dip_decision(
         )
         await db.commit()
 
+
+# ── ATH retry queue persistence ──────────────────────────────────────────────
+
+async def upsert_ath_retry(
+    address: str,
+    queued_at: float,
+    last_attempt: float,
+    first_success_at: float | None = None,
+    db_path: str = DB_PATH,
+):
+    """Mirror one in-memory _ath_retry_queue entry to disk. INSERT OR
+    REPLACE so the 2-field → 3-field transition (NULL → first_success_at
+    on first Birdeye success) is a single atomic write."""
+    async with db_connect(db_path) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO ath_retry_queue "
+            "(address, queued_at, last_attempt, first_success_at) "
+            "VALUES (?, ?, ?, ?)",
+            (address, queued_at, last_attempt, first_success_at),
+        )
+        await db.commit()
+
+
+async def delete_ath_retry(address: str, db_path: str = DB_PATH):
+    """Remove one address from the persisted retry queue."""
+    async with db_connect(db_path) as db:
+        await db.execute(
+            "DELETE FROM ath_retry_queue WHERE address = ?",
+            (address,),
+        )
+        await db.commit()
+
+
+async def load_ath_retry_queue(db_path: str = DB_PATH) -> dict[str, dict]:
+    """Load all persisted retry-queue rows into the in-memory shape used
+    by modules.ath_seeder._ath_retry_queue. Polymorphic on first_success_at:
+    rows with first_success_at IS NULL come back as 2-field dicts (no key
+    at all), matching the read site at ath_seeder which uses .get() and
+    treats absence as "not in reseed mode."""
+    if not os.path.exists(db_path):
+        return {}
+    out: dict[str, dict] = {}
+    async with db_connect(db_path) as db:
+        async with db.execute(
+            "SELECT address, queued_at, last_attempt, first_success_at "
+            "FROM ath_retry_queue"
+        ) as cursor:
+            async for row in cursor:
+                address, queued_at, last_attempt, first_success_at = row
+                entry: dict = {
+                    "queued_at": queued_at,
+                    "last_attempt": last_attempt,
+                }
+                if first_success_at is not None:
+                    entry["first_success_at"] = first_success_at
+                out[address] = entry
+    return out

@@ -427,6 +427,10 @@ async def main():
     from modules import ath_refresh_shadow
     await ath_refresh_shadow.startup_check(db_path, config)
 
+    # ── Rehydrate ATH retry queue from disk (survives restarts) ───────────
+    from modules import ath_seeder
+    await ath_seeder.rehydrate_retry_queue(db_path, config)
+
     # Init modules
     migration_ws = MigrationWebSocket(config)
     tracker      = PriceTracker(config)

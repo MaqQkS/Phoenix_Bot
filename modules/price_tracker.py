@@ -163,7 +163,7 @@ class PriceTracker:
                         else float("inf")
                     )
                     if age_seconds < 1800:
-                        ath_seeder.enqueue_retry(token)
+                        await ath_seeder.enqueue_retry(token)
                         logger.info(
                             f"Deferring 'running_max' promotion for {token.symbol} "
                             f"(age {age_seconds:.0f}s) — enqueued Birdeye retry"

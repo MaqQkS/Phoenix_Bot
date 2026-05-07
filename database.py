@@ -407,6 +407,52 @@ async def init_db(db_path: str = DB_PATH):
             )
         """)
 
+        # ── ATH floor evaluation log (Phase 1A — observe-only) ───────────
+        # One row per compute_pumpswap_floor evaluation at any of the three
+        # chain positions ('seed' | 't15m' | 'alert_refresh'). Birdeye and
+        # pumpswap_max columns nullable so no-data rounds still log.
+        # floor_applied=1 means the floor raised tokens.ath_price; 0 is a
+        # no-op observation. ratio = pumpswap_max / birdeye_ath, NULL when
+        # either side is falsy. Wired by Batch 2 commits.
+        async with db.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='ath_floor_log'"
+        ) as cur:
+            _ath_floor_log_existed = await cur.fetchone() is not None
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ath_floor_log (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address               TEXT NOT NULL,
+                symbol                      TEXT,
+                chain_position              TEXT NOT NULL,
+                evaluated_at                REAL NOT NULL,
+                prior_ath_price             REAL,
+                prior_ath_source            TEXT,
+                birdeye_ath_price           REAL,
+                pumpswap_max_price          REAL,
+                pumpswap_max_quote_lamports INTEGER,
+                pumpswap_max_block_time     REAL,
+                pumpswap_sample_count       INTEGER,
+                pumpswap_qualifying_count   INTEGER,
+                ratio                       REAL,
+                floor_applied               INTEGER NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_afl_token "
+            "ON ath_floor_log(token_address)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_afl_position "
+            "ON ath_floor_log(chain_position)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_afl_applied "
+            "ON ath_floor_log(floor_applied)"
+        )
+        if not _ath_floor_log_existed:
+            logger.info("Created ath_floor_log table (+ idx_afl_token, idx_afl_position, idx_afl_applied)")
+
         # ── Migration: Stage 2 +10s decision gate columns ────────────────
         # swap_density_5s persisted at trigger time (was discarded in
         # Stage 1). pre_dip_1m_swap_count populated by the +10s decision

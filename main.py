@@ -182,6 +182,42 @@ async def price_alert_loop(
                         )
                         if hf_log_row_id is not None:
                             await mark_actually_blocked(hf_log_row_id)
+
+                        # Set token-level ghost cooldown so subsequent ticks
+                        # skip tier eval until the holder-filter cache TTL
+                        # elapses + 60s buffer. Persist immediately so the
+                        # cooldown survives restart. Token-level (not tier-
+                        # level): a T1 ghost-block suppresses T2/T3 eval for
+                        # the same token until expiry. Coarse one-row-per-
+                        # (token, tier) alert_block_log entry adds retry-
+                        # count observability; detailed verdict reason stays
+                        # in holder_filter_log, recoverable via temporal
+                        # join on (token_address, alert_time ≈ block_time).
+                        cooldown_secs = (
+                            config.get("ghost_cooldown", {}).get("cooldown_seconds", 3660)
+                        )
+                        block_ts = time.time()
+                        token.ghost_cooldown_until = block_ts + cooldown_secs
+                        try:
+                            await db.save_token(token)
+                        except Exception as e:
+                            logger.error(
+                                f"Ghost cooldown save failed for ${token.symbol}: {e}"
+                            )
+                        try:
+                            await db.log_alert_block(
+                                token_address=token.address,
+                                symbol=token.symbol,
+                                would_have_tier=tier_index,
+                                tier_name=tier["name"],
+                                block_time=block_ts,
+                                block_reason=f"ghost_block_t{tier_index + 1}",
+                                no_fee_data=False,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Ghost alert_block_log write failed for ${token.symbol}: {e}"
+                            )
                         continue
 
                     # ── Birdeye-at-alert-time refresh — closes Dex poll cadence gap ──

@@ -68,6 +68,14 @@ class TrackedToken:
     # 0.0 = no cooldown active.
     phantom_cooldown_until: float = 0.0
 
+    # ── Ghost-block cooldown ──────────────────────────────────────────────
+    # Set in main.py when the holder filter returns verdict=block on any
+    # tier. While time.time() < this value, alert_trigger.check_tokens()
+    # suppresses tier evaluation for the token. TTL is the holder-filter
+    # cache TTL + 60s buffer (3660s) so the next eval after expiry takes
+    # a fresh snapshot. 0.0 = no cooldown active.
+    ghost_cooldown_until: float = 0.0
+
     # ── Pool metadata (fetched at migration time by migration_ws) ─────────
     # Set once from getAccountInfo on the PumpSwap pool + SPL mint. Immutable
     # after first write. NULL means "not yet determined" — the gRPC indexer

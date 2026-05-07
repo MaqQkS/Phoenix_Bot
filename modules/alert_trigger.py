@@ -106,6 +106,34 @@ class AlertTrigger:
                     )
                 continue
 
+            # ── Ghost-block cooldown ───────────────────────────────────
+            # Suppress tier eval when the holder filter returned
+            # verdict=block on a recent tier evaluation. Window is the
+            # holder-filter cache TTL + 60s (~3660s) so the next eval
+            # after expiry takes a fresh snapshot rather than re-using
+            # the cached verdict that triggered the cooldown. Token-level
+            # (not tier-level): a T1 ghost-block suppresses T2/T3 eval
+            # for the same token until expiry.
+            if token.ghost_cooldown_until and now_ts < token.ghost_cooldown_until:
+                remaining = token.ghost_cooldown_until - now_ts
+                drop_preview = token.drop_from_ath
+                preview_tier_idx = -1
+                for i, tier in enumerate(self.tiers):
+                    if tier["min_drop"] <= drop_preview < tier["max_drop"]:
+                        preview_tier_idx = i
+                        break
+                if preview_tier_idx > token.last_alerted_tier:
+                    logger.info(
+                        f"⏸️  ${token.symbol} would-have-alerted Tier {preview_tier_idx + 1} "
+                        f"but ghost cooldown active (expires in {remaining:.0f}s)"
+                    )
+                else:
+                    logger.info(
+                        f"⏸️  ${token.symbol} tier eval suppressed (ghost cooldown, "
+                        f"{remaining:.0f}s remaining)"
+                    )
+                continue
+
             drop = token.drop_from_ath  # e.g. 0.72 = 72% drop
 
             # Find which tier this drop falls into

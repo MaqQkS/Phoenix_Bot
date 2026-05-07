@@ -73,7 +73,8 @@ async def init_db(db_path: str = DB_PATH):
                 ath_source      TEXT DEFAULT 'unseeded',
                 pool_orientation TEXT DEFAULT NULL,
                 token_decimals  INTEGER DEFAULT NULL,
-                phantom_cooldown_until REAL DEFAULT 0
+                phantom_cooldown_until REAL DEFAULT 0,
+                ghost_cooldown_until REAL DEFAULT 0
             )
         """)
         await db.execute("""
@@ -549,6 +550,20 @@ async def init_db(db_path: str = DB_PATH):
             await db.commit()
             logger.info("Migrated tokens: added phantom_cooldown_until column")
 
+        # ── Migration: ghost_cooldown_until on tokens ─────────────────────
+        # Set in main.py when the holder filter returns verdict=block on
+        # any tier. alert_trigger reads this flag to suppress tier
+        # evaluation during the cooldown window. Default 0 = no cooldown
+        # active. Forward-only, no backfill.
+        async with db.execute("PRAGMA table_info(tokens)") as cur:
+            tokens_cols = [row[1] async for row in cur]
+        if "ghost_cooldown_until" not in tokens_cols:
+            await db.execute(
+                "ALTER TABLE tokens ADD COLUMN ghost_cooldown_until REAL DEFAULT 0"
+            )
+            await db.commit()
+            logger.info("Migrated tokens: added ghost_cooldown_until column")
+
         # ── Migration: drawdown + timing columns on alerts ────────────────
         # Post-alert outcome tracking. Forward-only: historical alerts stay
         # NULL on all six columns — NULL means "we weren't tracking at the
@@ -584,7 +599,8 @@ async def save_token(token: TrackedToken, db_path: str = DB_PATH):
                 :migration_time, :last_price_update,
                 :last_alerted_tier, :ath_source,
                 :pool_orientation, :token_decimals,
-                :phantom_cooldown_until
+                :phantom_cooldown_until,
+                :ghost_cooldown_until
             )
         """, {
             "address":           token.address,
@@ -609,6 +625,7 @@ async def save_token(token: TrackedToken, db_path: str = DB_PATH):
             "pool_orientation":  token.pool_orientation,
             "token_decimals":    token.token_decimals,
             "phantom_cooldown_until": token.phantom_cooldown_until,
+            "ghost_cooldown_until": token.ghost_cooldown_until,
         })
         await db.commit()
 
@@ -806,6 +823,13 @@ def _row_to_token(row) -> TrackedToken:
     except (IndexError, KeyError):
         phantom_cooldown_until = 0.0
 
+    # ghost_cooldown_until added with the ghost-block alert-loop fix;
+    # defend against rows loaded before the migration ran.
+    try:
+        ghost_cooldown_until = row["ghost_cooldown_until"] or 0.0
+    except (IndexError, KeyError):
+        ghost_cooldown_until = 0.0
+
     return TrackedToken(
         address           = row["address"],
         symbol            = row["symbol"] or "???",
@@ -829,6 +853,7 @@ def _row_to_token(row) -> TrackedToken:
         pool_orientation  = pool_orientation,
         token_decimals    = token_decimals,
         phantom_cooldown_until = phantom_cooldown_until,
+        ghost_cooldown_until = ghost_cooldown_until,
     )
 
 

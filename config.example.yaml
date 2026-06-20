@@ -1,0 +1,169 @@
+# Phoenix Bot configuration — EXAMPLE / TEMPLATE
+# Copy this file to `config.yaml` and fill in your own secrets.
+# `config.yaml` is gitignored and must never be committed.
+
+# ── Telegram ──────────────────────────────────────────────────────────────
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"      # from @BotFather
+  chat_id: "YOUR_TELEGRAM_CHAT_ID"          # target chat / channel id
+
+# ── Helius RPC ─────────────────────────────────────────────────────────────
+helius:
+  api_key: "YOUR_HELIUS_API_KEY"
+  rpc_url: "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY"
+
+# ── Birdeye ────────────────────────────────────────────────────────────────
+birdeye:
+  api_key: "YOUR_BIRDEYE_API_KEY"
+
+# ── Solana RPC (balance lookups — separate from Helius) ───────────────────
+# Used by snapshot_holders.py for getMultipleAccounts (SOL balances).
+# Falls back to public endpoint if empty. Set a dedicated RPC for production.
+solana_rpc:
+  url: "YOUR_SOLANA_RPC_URL"
+
+# ── Tracking ───────────────────────────────────────────────────────────────
+tracking:
+  poll_interval_seconds: 30        # how often to poll prices
+  migration_check_interval: 20     # how often to check for new migrations
+  min_pump_multiple: 1.39          # token must Nx from migration before dip alerts
+  max_price_age_seconds: 300       # skip alerts if last Dex price update is older/unknown
+  max_token_age_hours: 48          # stop tracking tokens older than this
+  periodic_backfill_seconds: 180   # safety net poll interval (3 min)
+
+# ── ATH Retry Cadence ──────────────────────────────────────────────────────
+# Controls how aggressively the bot retries Birdeye to seed ATH when the
+# token is too fresh to be indexed on first try. While ath_source is
+# 'unseeded' or 'fallback', the token keeps being retried on this schedule.
+# Once Birdeye finally returns a positive value, ath_source flips to
+# 'birdeye' and the retry stops. If the max_age_seconds ceiling is reached
+# without Birdeye success, ath_source transitions to 'running_max' and the
+# live-poll running max becomes authoritative.
+ath_retry:
+  initial_interval_seconds: 30     # retry every 30s during the hot window
+  initial_window_seconds: 600      # hot window = first 10 min after migration
+  sustained_interval_seconds: 120  # then back off to every 2 min
+  sustained_window_seconds: 1800   # sustained window = up to 30 min total
+  max_age_seconds: 1800            # give up after 30 min total
+  reseed_window_seconds: 600       # keep re-querying for 10 min after first success
+  correction_delay_seconds: 900    # one-shot correction at T+15 min (900s)
+
+# ── Dip Alert Tiers ────────────────────────────────────────────────────────
+# Alert fires when drop_from_ath >= tier threshold
+# Each tier only fires once, then moves to next tier
+dip_tiers:
+  - name: "Tier 1"
+    min_drop: 0.50    # 50%
+    max_drop: 0.60    # 60%
+  - name: "Tier 2"
+    min_drop: 0.62
+    max_drop: 0.80
+  - name: "Tier 3"
+    min_drop: 0.82
+    max_drop: 0.95
+
+# ── Database ───────────────────────────────────────────────────────────────
+database:
+  path: "data/bot.db"
+
+# ── Fee Gate (shadow-mode scam labeling) ──────────────────────────────────
+# Labels alerts using PumpSwap fee decomposition. Label-only — never blocks.
+# Promotion target: SCAM Likely precision >= 0.90 over 7 days (>= 25 flags).
+fee_gate:
+  enabled: true
+  blocking_enabled: true        # kill switch — when true, gate hard-blocks alerts
+  block_labels:                  # which fee_gate labels trigger a permanent block
+    - "SCAM Likely"
+
+  thresholds:
+    bribes_pct_hard: 2.81
+    bribes_pct_soft: 5.0
+    creator_dom_hi: 0.70
+    tx_count_min: 500
+
+  labels:
+    suspicious_min: 3
+    scam_likely_min: 4
+    # ── LP Floor Filter (Thesis 3) ────────────────────────────────────────────
+# Flags tokens with liquidity too thin to trade without massive slippage.
+# Label-only in shadow mode. Promotion target: >=90% of flagged tokens die.
+lp_floor:
+  enabled: true
+  min_liquidity_usd: 8000        # below this → LP: LOW
+  warn_liquidity_usd: 12000      # below this → LP: THIN (informational)
+
+# ── Bundle Gate (shadow-mode inception bundle/wash detection) ─────────────
+# Pulls every pump.fun bonding-curve trade for a freshly migrated token,
+# aggregates trades in slots [inception, inception+5], labels per rule.
+# Label-only — never blocks alerts. Logs to bundle_gate_log table.
+inspection_gate:
+  enabled: true
+  threshold_version: "v2_10000usd_0.07ratio"
+  window_slots: 5
+  min_buy_usd: 10000.0
+  max_sell_buy_ratio: 0.07
+  min_events: 3
+
+# ── Ante (Phase 1 — observe-only per-swap fee-burn primitive) ─────────────
+# Ante = base_fee + priority_fee + jito_tip per tx, sampled at the tx level
+# from pumpswap_fees. Observe mode: append 2 lines to alerts + write one
+# ante_log row per alert. No gating, no tier changes, no suppression.
+# Promotion to mode=gate is Phase 3 (explicit config + code change).
+ante:
+  enabled: true
+  mode: observe        # observe only — any other value disables Ante entirely
+  window_n: 20         # rolling median over last N distinct-signature swaps
+  window_seconds: 300  # rolling median over last N seconds
+  verbose: true        # Phase 1 debug logging in the gRPC indexer
+
+# ── Ante Taxonomy (ghost mode — categorical labels on top of numeric Ante) ──
+# Labels are recorded + displayed, never gate alerts. Ante logic itself is
+# unchanged. See modules/ante_taxonomy.py for rule definitions.
+ante_taxonomy:
+  floor_sol: 0.000005           # 5 µSOL — physical Solana floor
+  real_fee_sol: 0.0001          # 100 µSOL
+  min_samples: 10
+  wash_width_max: 2.0
+  bimodal_width_min: 25.0
+  coordinated_width_max: 3.0
+
+# ── Phantom Validator (BLICKY phantom-dip suppression) ───────────────────
+# After Birdeye writes a new ATH, cross-checks Birdeye-current-price
+# against the new ATH. If they're close (within phantom_threshold_pct),
+# the token is at-or-near peak and any Dex-derived "drawdown" is the
+# stale-cache phantom signature. Suppresses tier evaluation for
+# cooldown_seconds while Dex's cache refreshes.
+#
+# Fail-open: any Birdeye 4xx/5xx, timeout, or malformed response leaves
+# alerts firing as today — better to risk a phantom than miss a real dip.
+# `enabled: false` is the kill switch.
+phantom_validator:
+  enabled: true
+  phantom_threshold_pct: 0.40    # Birdeye-current >= 60% of ATH = phantom
+  cooldown_seconds: 120          # how long to suppress tier evals
+  birdeye_timeout_sec: 5
+  fail_open_on_error: true
+
+# ── Ghost-block cooldown ──────────────────────────────────────────────────
+# When the holder filter returns verdict=block on any tier, set a token-
+# level cooldown so subsequent ticks don't immediately re-evaluate the
+# same (likely cached) ghost verdict. TTL = holder_filter cache TTL
+# (3600s) + 60s buffer so the next eval after expiry takes a fresh
+# snapshot. Reader (alert_trigger) is config-free — cooldown is just
+# `time.time() < token.ghost_cooldown_until`. This key only feeds the
+# main.py setter; hardcoded 3660 fallback if missing.
+ghost_cooldown:
+  cooldown_seconds: 3660
+
+# ── ATH Refresh Shadow (48h logging-only instrumentation) ─────────────────
+# Records what a future adaptive ATH-refresh system WOULD do. Zero Birdeye
+# calls, zero changes to alert logic. Auto-disables 48h after first log
+# entry. To remove: flip enabled:false, delete modules/ath_refresh_shadow.py
+# and its call sites, drop ath_refresh_shadow_log table.
+ath_refresh_shadow:
+  enabled: false
+  hour_1_threshold_pct: 10
+  hour_2_plus_threshold_pct: 20
+  reseed_times_seconds: [60, 300]
+  snapshot_interval_seconds: 3600
+  auto_disable_after_hours: 48

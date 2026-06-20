@@ -37,3 +37,26 @@ launch_time.txt
 
 # Generated scratch (diagnostic scripts only — keep generated/*pb2*.py)
 generated/_readonly_*.py
+
+# Bot config — contains LIVE secrets. Copy config.example.yaml -> config.yaml.
+config.yaml
+
+# Claude Code local state & worktrees
+.claude/
+
+# Research data exports (large, regenerable)
+research_exports/
+
+# Working diffs & local backups
+uncommitted_backup/
+diff_*.txt
+
+# Excluded proto extras (branding images + research index export)
+proto/phoenixof.png
+proto/phx1111.png
+proto/phximg1.png
+proto/Session 17*
+
+# Stray scratch files
+1777817350
+unixepoch

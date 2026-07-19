@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./phoenix-ascii.svg" alt="Phoenix ASCII art" width="100%">
+</p>
+
 # 🔥 Phoenix Bot (PHX1)
 
 **An anti-manipulation research system for Solana token markets.**
